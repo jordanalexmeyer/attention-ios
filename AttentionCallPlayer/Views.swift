@@ -1975,6 +1975,15 @@ struct TranscriptView: View {
                     .padding(.bottom, 8)
                 }
             }
+            // Open positioned at the current playback spot, not the top.
+            .onAppear {
+                jumpToPlayhead(proxy: proxy)
+            }
+            // The transcript loads asynchronously; if the view appeared before
+            // it arrived, position once it lands.
+            .onChange(of: player.currentTranscript.count) { _, _ in
+                jumpToPlayhead(proxy: proxy)
+            }
             .onChange(of: player.activeSegment()?.id) { _, id in
                 guard let id, followPlayback, !selection.isSelecting else { return }
                 withAnimation {
@@ -2011,6 +2020,16 @@ struct TranscriptView: View {
                 }
             }
         }
+    }
+
+    /// Instantly position the transcript at the playhead (no animation), e.g.
+    /// when the player is opened mid-call.
+    private func jumpToPlayhead(proxy: ScrollViewProxy) {
+        guard followPlayback, !selection.isSelecting, player.currentTime > 1 else { return }
+        // last(where:) instead of activeSegment(): lands on the right spot even
+        // when the playhead sits in a silence between segments.
+        guard let id = player.currentTranscript.last(where: { $0.startTime <= player.currentTime })?.id else { return }
+        proxy.scrollTo(id, anchor: .center)
     }
 }
 
