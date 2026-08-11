@@ -1981,6 +1981,16 @@ struct TranscriptView: View {
                     proxy.scrollTo(id, anchor: .center)
                 }
             }
+            // Track the active word so long monologue blocks scroll line by
+            // line instead of parking on the segment's center. Words on the
+            // same line share a vertical position, so most changes are no-ops
+            // and the view only glides down when the speech wraps to a new line.
+            .onChange(of: player.currentWord()?.id) { _, wordID in
+                guard let wordID, followPlayback, !selection.isSelecting else { return }
+                withAnimation(.easeInOut(duration: 0.25)) {
+                    proxy.scrollTo(wordID, anchor: .center)
+                }
+            }
             .onChange(of: scrollRequestID) { _, id in
                 guard let id else { return }
                 withAnimation {
@@ -2071,6 +2081,9 @@ struct TranscriptSegmentView: View, Equatable {
                                     .fill(wordBackground(word))
                                     .padding(-2)
                             )
+                            // Scroll anchor so follow mode can track the active
+                            // word through long monologue blocks.
+                            .id(word.id)
                     }
                 }
             }

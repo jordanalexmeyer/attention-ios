@@ -326,8 +326,10 @@ final class PlayerManager: ObservableObject {
     func currentWord(at time: TimeInterval? = nil) -> TranscriptWord? {
         let current = time ?? currentTime
         guard let index = indexOfLastWord(startingAtOrBefore: current) else { return nil }
-        let word = flatWords[index]
-        return current <= word.endTimestamp ? word : nil
+        // Sticky: keep the last-started word highlighted through the small
+        // gaps between word windows, so the highlight never flickers off
+        // mid-sentence. It only moves when the next word begins.
+        return flatWords[index]
     }
 
     /// Binary search over the flattened, time-sorted word list.
@@ -428,6 +430,8 @@ final class PlayerManager: ObservableObject {
     }
 
     private func addTimeObserver() {
+        // 4Hz: 10Hz was tried for tighter word highlighting but caused visible
+        // UI slowdown; the sticky word highlight covers most perceived skips.
         timeObserver = player.addPeriodicTimeObserver(
             forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
             queue: .main
