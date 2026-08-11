@@ -1,0 +1,16 @@
+# Build artifacts
+build/
+DerivedData/
+*.ipa
+*.xcarchive
+
+# Xcode user state
+xcuserdata/
+*.xcuserstate
+
+# macOS
+.DS_Store
+
+# Secrets — never commit App Store Connect or API keys
+*.p8
+AuthKey_*
