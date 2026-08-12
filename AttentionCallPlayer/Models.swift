@@ -446,12 +446,16 @@ final class PlaybackBookmark {
     var position: TimeInterval
     var duration: TimeInterval
     var updatedAt: Date
+    /// Played to the end at least once. Distinct from position, which resets
+    /// to 0 on completion so replays start over.
+    var completed: Bool = false
 
-    init(conversationID: String, title: String, position: TimeInterval, duration: TimeInterval) {
+    init(conversationID: String, title: String, position: TimeInterval, duration: TimeInterval, completed: Bool = false) {
         self.conversationID = conversationID
         self.title = title
         self.position = position
         self.duration = duration
+        self.completed = completed
         self.updatedAt = Date()
     }
 }

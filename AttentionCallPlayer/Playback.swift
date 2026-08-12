@@ -92,6 +92,7 @@ final class PlayerManager: ObservableObject {
         currentTranscript = detailed.transcript
         flatWords = detailed.transcript.flatMap(\.words)
         self.queue = queue.filter { $0.id != conversation.id }
+        manuallyQueuedIDs.formIntersection(self.queue.map(\.id))
         persistQueue()
         let resumeAt = bookmarkPosition(for: detailed.id)
 
@@ -208,15 +209,26 @@ final class PlayerManager: ObservableObject {
     }
 
     func playNext() {
-        if let next = queue.first {
-            let remaining = Array(queue.dropFirst())
-            Task {
-                await play(next, queue: remaining)
+        // Walk the queue: explicitly queued calls always play (the user asked
+        // for them), but finished calls that were auto-queued from a list
+        // context are skipped (Spotify/Apple Podcasts behavior).
+        var remaining = queue
+        while let candidate = remaining.first {
+            remaining = Array(remaining.dropFirst())
+            if manuallyQueuedIDs.contains(candidate.id) || !isFinished(conversationID: candidate.id) {
+                manuallyQueuedIDs.remove(candidate.id)
+                let rest = remaining
+                Task {
+                    await play(candidate, queue: rest)
+                }
+                return
             }
-            return
         }
-        // Queue is empty: roll into the newest unplayed call (Apple Podcasts behavior).
-        guard let next = nextUnplayedConversation() else {
+        queue = []
+        persistQueue()
+        // Queue exhausted: resume the most recent in-progress call, else the
+        // newest never-started call. Finished calls never come back on their own.
+        guard let next = nextAutoplayConversation() else {
             pause()
             return
         }
@@ -225,14 +237,54 @@ final class PlayerManager: ObservableObject {
         }
     }
 
-    private func nextUnplayedConversation() -> Conversation? {
+    private func bookmark(for conversationID: String) -> PlaybackBookmark? {
         guard let modelContext else { return nil }
-        let playedIDs = Set(((try? modelContext.fetch(FetchDescriptor<PlaybackBookmark>())) ?? []).map(\.conversationID))
+        let descriptor = FetchDescriptor<PlaybackBookmark>(
+            predicate: #Predicate { $0.conversationID == conversationID }
+        )
+        return try? modelContext.fetch(descriptor).first
+    }
+
+    private func isFinished(conversationID: String) -> Bool {
+        guard let bookmark = bookmark(for: conversationID) else { return false }
+        return isFinished(bookmark)
+    }
+
+    private func isFinished(_ bookmark: PlaybackBookmark) -> Bool {
+        if bookmark.completed { return true }
+        // Legacy bookmarks (before the completed flag) parked near the end.
+        guard bookmark.duration > 0 else { return false }
+        return bookmark.position >= bookmark.duration - 10 || bookmark.position >= bookmark.duration * 0.95
+    }
+
+    private func nextAutoplayConversation() -> Conversation? {
+        guard let modelContext else { return nil }
+        let bookmarks = (try? modelContext.fetch(FetchDescriptor<PlaybackBookmark>())) ?? []
+        let bookmarksByID = Dictionary(bookmarks.map { ($0.conversationID, $0) }, uniquingKeysWith: { first, _ in first })
         let currentID = currentConversation?.id
-        return ((try? modelContext.fetch(FetchDescriptor<CachedConversation>())) ?? [])
-            .sorted { ($0.createdAt ?? .distantPast) > ($1.createdAt ?? .distantPast) }
+        let candidates = ((try? modelContext.fetch(FetchDescriptor<CachedConversation>())) ?? [])
             .map(Conversation.init(cache:))
-            .first { $0.id != currentID && !playedIDs.contains($0.id) && $0.isPlayable }
+            .filter { conversation in
+                guard conversation.id != currentID, conversation.isPlayable else { return false }
+                guard let bookmark = bookmarksByID[conversation.id] else { return true }
+                return !isFinished(bookmark)
+            }
+
+        // 1. In-progress calls, most recently listened first.
+        let inProgress = candidates
+            .compactMap { conversation -> (Conversation, Date)? in
+                guard let bookmark = bookmarksByID[conversation.id], bookmark.position > 5 else { return nil }
+                return (conversation, bookmark.updatedAt)
+            }
+            .max { $0.1 < $1.1 }
+        if let inProgress {
+            return inProgress.0
+        }
+
+        // 2. Never-started calls, newest first.
+        return candidates
+            .filter { bookmarksByID[$0.id] == nil }
+            .max { ($0.createdAt ?? .distantPast) < ($1.createdAt ?? .distantPast) }
     }
 
     private func observeAudioSessionNotifications() {
@@ -281,6 +333,10 @@ final class PlayerManager: ObservableObject {
         }
     }
 
+    /// Calls the user deliberately added via "Add to Queue" — these always play
+    /// on auto-advance, unlike calls auto-queued from a list context.
+    private var manuallyQueuedIDs: Set<String> = []
+
     func enqueue(_ conversations: [Conversation]) {
         let currentID = currentConversation?.id
         let incoming = conversations.filter { $0.id != currentID }
@@ -289,10 +345,14 @@ final class PlayerManager: ObservableObject {
             queue.append(conversation)
             seen.insert(conversation.id)
         }
+        manuallyQueuedIDs.formUnion(incoming.map(\.id))
         persistQueue()
     }
 
     func removeFromQueue(at offsets: IndexSet) {
+        for index in offsets {
+            manuallyQueuedIDs.remove(queue[index].id)
+        }
         queue.remove(atOffsets: offsets)
         persistQueue()
     }
@@ -304,13 +364,16 @@ final class PlayerManager: ObservableObject {
 
     func clearQueue() {
         queue.removeAll()
+        manuallyQueuedIDs.removeAll()
         persistQueue()
     }
 
     private let queueDefaultsKey = "attention.queueIDs"
+    private let manualQueueDefaultsKey = "attention.manualQueueIDs"
 
     private func persistQueue() {
         UserDefaults.standard.set(queue.map(\.id), forKey: queueDefaultsKey)
+        UserDefaults.standard.set(Array(manuallyQueuedIDs), forKey: manualQueueDefaultsKey)
     }
 
     /// Rebuild the queue from cached conversations after a relaunch.
@@ -321,6 +384,8 @@ final class PlayerManager: ObservableObject {
         let cached = (try? modelContext.fetch(FetchDescriptor<CachedConversation>())) ?? []
         let byID = Dictionary(cached.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
         queue = ids.compactMap { byID[$0].map(Conversation.init(cache:)) }
+        let manual = UserDefaults.standard.stringArray(forKey: manualQueueDefaultsKey) ?? []
+        manuallyQueuedIDs = Set(manual).intersection(queue.map(\.id))
     }
 
     func currentWord(at time: TimeInterval? = nil) -> TranscriptWord? {
@@ -460,6 +525,7 @@ final class PlayerManager: ObservableObject {
         ) { [weak self] _ in
             Task { @MainActor in
                 guard let self else { return }
+                self.markCurrentCallFinished()
                 if self.autoplayQueueEnabled {
                     self.playNext()
                 } else {
@@ -469,6 +535,32 @@ final class PlayerManager: ObservableObject {
         }
     }
 
+    /// A call that played to the end keeps its bookmark (so it still counts as
+    /// played) but the resume point resets, so replaying starts from the top.
+    private func markCurrentCallFinished() {
+        guard let currentConversation, let modelContext else { return }
+        let conversationID = currentConversation.id
+        let descriptor = FetchDescriptor<PlaybackBookmark>(
+            predicate: #Predicate { $0.conversationID == conversationID }
+        )
+        if let bookmark = try? modelContext.fetch(descriptor).first {
+            bookmark.position = 0
+            bookmark.completed = true
+            bookmark.updatedAt = Date()
+        } else {
+            modelContext.insert(PlaybackBookmark(
+                conversationID: conversationID,
+                title: currentConversation.title,
+                position: 0,
+                duration: duration,
+                completed: true
+            ))
+        }
+        try? modelContext.save()
+        // Zero the clock so the pause() below can't re-save the end position.
+        currentTime = 0
+    }
+
     private func bookmarkPosition(for conversationID: String) -> TimeInterval {
         guard let modelContext else {
             return 0
@@ -476,7 +568,10 @@ final class PlayerManager: ObservableObject {
         let descriptor = FetchDescriptor<PlaybackBookmark>(
             predicate: #Predicate { $0.conversationID == conversationID }
         )
-        return (try? modelContext.fetch(descriptor).first?.position) ?? 0
+        guard let bookmark = try? modelContext.fetch(descriptor).first else { return 0 }
+        // Smart resume: finished calls restart from the top instead of playing
+        // the tail and immediately ending.
+        return isFinished(bookmark) ? 0 : bookmark.position
     }
 
     private func saveBookmark() {

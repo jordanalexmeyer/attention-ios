@@ -56,6 +56,8 @@ struct LibraryView: View {
     @State private var pageCount = 1
     @State private var isLoading = false
     @State private var errorMessage: String?
+    /// Fresh spinner identity per retry (List reuse can eat respawned spinners).
+    @State private var retryNonce = 0
 
     private var playedIDs: Set<String> {
         Set(bookmarks.map(\.conversationID))
@@ -70,14 +72,44 @@ struct LibraryView: View {
             List {
                 if let errorMessage {
                     Section {
-                        VStack(alignment: .leading, spacing: 8) {
-                            Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
-                                .foregroundStyle(.orange)
-                                .font(.subheadline)
-                            Button("Retry") {
-                                Task { await refresh() }
+                        VStack(spacing: 12) {
+                            HStack(alignment: .top, spacing: 10) {
+                                Image(systemName: "wifi.exclamationmark")
+                                    .font(.title3)
+                                    .foregroundStyle(.orange)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Couldn't load calls")
+                                        .font(.subheadline.weight(.semibold))
+                                    Text(errorMessage)
+                                        .font(.caption)
+                                        .foregroundStyle(.secondary)
+                                }
+                                Spacer(minLength: 0)
                             }
+                            Button {
+                                retryNonce += 1
+                                Task { await refresh() }
+                            } label: {
+                                HStack(spacing: 6) {
+                                    if isLoading {
+                                        ProgressView()
+                                            .id(retryNonce)
+                                            .controlSize(.small)
+                                        Text("Retrying…")
+                                    } else {
+                                        Image(systemName: "arrow.clockwise")
+                                        Text("Try Again")
+                                    }
+                                }
+                                .font(.subheadline.weight(.semibold))
+                                .frame(maxWidth: .infinity)
+                                .padding(.vertical, 2)
+                            }
+                            .buttonStyle(.bordered)
+                            .tint(.indigo)
+                            .disabled(isLoading)
                         }
+                        .padding(.vertical, 4)
                     }
                 }
 
@@ -1706,8 +1738,8 @@ struct NowPlayingView: View {
                 transportButton(icon: "goforward.\(Int(player.skipInterval))", caption: "\(Int(player.skipInterval))s") {
                     player.skip(by: player.skipInterval)
                 }
-                transportButton(icon: "forward.end.fill", caption: "Speaker") {
-                    player.skipToNextSpeaker()
+                transportButton(icon: "forward.end.fill", caption: "Next call") {
+                    player.playNext()
                 }
             }
 
