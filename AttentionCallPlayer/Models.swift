@@ -460,6 +460,135 @@ final class PlaybackBookmark {
     }
 }
 
+/// Local record of a snippet created in this app. The Attention API can create
+/// snippets but has no endpoint to list them back, so this is the app's memory.
+@Model
+final class SavedSnippet {
+    @Attribute(.unique) var snippetID: String
+    var title: String
+    var callTitle: String
+    var conversationID: String
+    var startTime: TimeInterval
+    var endTime: TimeInterval
+    var urlString: String
+    var createdAt: Date
+    /// Notes are write-once on the API side (create only), so this mirrors
+    /// what was sent at creation.
+    var notes: String = ""
+    /// Library placement chosen at creation (client-side record — the API
+    /// can't list folder contents back).
+    var inLibrary: Bool = false
+    var inMyLibrary: Bool = true
+    /// Legacy server folder path; unused now that folders are local-only.
+    var libraryFolder: String = ""
+    /// Device-local folder name; empty string means unfiled.
+    var localFolder: String = ""
+
+    init(
+        snippetID: String,
+        title: String,
+        callTitle: String,
+        conversationID: String,
+        startTime: TimeInterval,
+        endTime: TimeInterval,
+        urlString: String,
+        notes: String = "",
+        inLibrary: Bool = false,
+        inMyLibrary: Bool = true,
+        localFolder: String = ""
+    ) {
+        self.snippetID = snippetID
+        self.title = title
+        self.callTitle = callTitle
+        self.conversationID = conversationID
+        self.startTime = startTime
+        self.endTime = endTime
+        self.urlString = urlString
+        self.notes = notes
+        self.inLibrary = inLibrary
+        self.inMyLibrary = inMyLibrary
+        self.localFolder = localFolder
+        self.createdAt = Date()
+    }
+
+    var url: URL? {
+        URL(string: urlString)
+    }
+}
+
+/// Device-local playlist — the Attention API has no playlist concept.
+/// Calls are referenced by ID and resolved against the conversation cache.
+@Model
+final class Playlist {
+    @Attribute(.unique) var uuid: String
+    var name: String
+    var createdAt: Date
+    /// Ordered call IDs; titles stored alongside so entries survive cache eviction.
+    var conversationIDs: [String] = []
+    var titlesByID: [String: String] = [:]
+
+    init(name: String) {
+        self.uuid = UUID().uuidString
+        self.name = name
+        self.createdAt = Date()
+    }
+
+    func contains(_ conversationID: String) -> Bool {
+        conversationIDs.contains(conversationID)
+    }
+
+    func toggle(_ conversation: Conversation) {
+        if let index = conversationIDs.firstIndex(of: conversation.id) {
+            conversationIDs.remove(at: index)
+            titlesByID[conversation.id] = nil
+        } else {
+            conversationIDs.append(conversation.id)
+            titlesByID[conversation.id] = conversation.title
+        }
+    }
+}
+
+/// Device-local snippet folder — plain organization, nothing on Attention's side.
+@Model
+final class SnippetFolder {
+    @Attribute(.unique) var name: String
+    var createdAt: Date
+
+    init(name: String) {
+        self.name = name
+        self.createdAt = Date()
+    }
+}
+
+/// A teammate you follow, Spotify-artist style. Device-local; their calls are
+/// fetched live by filtering conversations on owner email.
+@Model
+final class FollowedArtist {
+    @Attribute(.unique) var email: String
+    var name: String
+    var createdAt: Date
+
+    init(email: String, name: String) {
+        self.email = email
+        self.name = name
+        self.createdAt = Date()
+    }
+}
+
+/// Device-local favorites — the Attention API has no favorites concept.
+@Model
+final class FavoriteCall {
+    @Attribute(.unique) var conversationID: String
+    var title: String
+    var createdAt: Date
+
+    init(conversationID: String, title: String) {
+        self.conversationID = conversationID
+        self.title = title
+        self.createdAt = Date()
+    }
+}
+
 @Model
 final class DownloadedCall {
     @Attribute(.unique) var conversationID: String

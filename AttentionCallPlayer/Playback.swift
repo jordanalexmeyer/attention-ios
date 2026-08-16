@@ -91,6 +91,8 @@ final class PlayerManager: ObservableObject {
         currentConversation = detailed
         currentTranscript = detailed.transcript
         flatWords = detailed.transcript.flatMap(\.words)
+        // Deliberately playing a call forgives an earlier "next" skip.
+        sessionSkippedIDs.remove(detailed.id)
         self.queue = queue.filter { $0.id != conversation.id }
         manuallyQueuedIDs.formIntersection(self.queue.map(\.id))
         persistQueue()
@@ -209,6 +211,12 @@ final class PlayerManager: ObservableObject {
     }
 
     func playNext() {
+        // Leaving a call unfinished via "next" means "not this one right now" —
+        // don't offer it again this session. (A call that just played to the
+        // end is already marked finished, so it won't be added here.)
+        if let current = currentConversation, !isFinished(conversationID: current.id) {
+            sessionSkippedIDs.insert(current.id)
+        }
         // Walk the queue: explicitly queued calls always play (the user asked
         // for them), but finished calls that were auto-queued from a list
         // context are skipped (Spotify/Apple Podcasts behavior).
@@ -265,7 +273,8 @@ final class PlayerManager: ObservableObject {
         let candidates = ((try? modelContext.fetch(FetchDescriptor<CachedConversation>())) ?? [])
             .map(Conversation.init(cache:))
             .filter { conversation in
-                guard conversation.id != currentID, conversation.isPlayable else { return false }
+                guard conversation.id != currentID, conversation.isPlayable,
+                      !sessionSkippedIDs.contains(conversation.id) else { return false }
                 guard let bookmark = bookmarksByID[conversation.id] else { return true }
                 return !isFinished(bookmark)
             }
@@ -336,6 +345,10 @@ final class PlayerManager: ObservableObject {
     /// Calls the user deliberately added via "Add to Queue" — these always play
     /// on auto-advance, unlike calls auto-queued from a list context.
     private var manuallyQueuedIDs: Set<String> = []
+    /// Calls skipped via "next" this session. Excluded from the auto-advance
+    /// fallback, otherwise skipping an in-progress call just offers it right
+    /// back (its bookmark is always the most recently updated) — infinite loop.
+    private var sessionSkippedIDs: Set<String> = []
 
     func enqueue(_ conversations: [Conversation]) {
         let currentID = currentConversation?.id

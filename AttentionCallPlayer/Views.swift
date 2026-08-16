@@ -49,7 +49,9 @@ struct LibraryView: View {
     @Environment(\.modelContext) private var modelContext
     @Query(sort: \CachedConversation.createdAt, order: .reverse) private var cachedConversations: [CachedConversation]
     @Query(sort: \PlaybackBookmark.updatedAt, order: .reverse) private var bookmarks: [PlaybackBookmark]
-    @Query(sort: \DownloadedCall.createdAt, order: .reverse) private var downloadedCalls: [DownloadedCall]
+    @Query(sort: \FavoriteCall.createdAt, order: .reverse) private var favorites: [FavoriteCall]
+    @Query(sort: \Playlist.createdAt) private var playlists: [Playlist]
+    @Query(sort: \FollowedArtist.name) private var followedArtists: [FollowedArtist]
 
     @State private var conversations: [Conversation] = []
     @State private var page = 1
@@ -58,14 +60,6 @@ struct LibraryView: View {
     @State private var errorMessage: String?
     /// Fresh spinner identity per retry (List reuse can eat respawned spinners).
     @State private var retryNonce = 0
-
-    private var playedIDs: Set<String> {
-        Set(bookmarks.map(\.conversationID))
-    }
-
-    private var downloadedByID: [String: DownloadedCall] {
-        Dictionary(downloadedCalls.map { ($0.conversationID, $0) }, uniquingKeysWith: { first, _ in first })
-    }
 
     var body: some View {
         NavigationStack {
@@ -116,7 +110,12 @@ struct LibraryView: View {
                 if let continueItem = continueListeningTarget {
                     Section("Continue Listening") {
                         Button {
-                            Task { await player.play(continueItem.conversation, queue: conversations) }
+                            if player.currentConversation?.id == continueItem.conversation.id {
+                                // Already loaded: open the player instead of reloading.
+                                appState.presentNowPlaying = true
+                            } else {
+                                Task { await player.play(continueItem.conversation, queue: conversations) }
+                            }
                         } label: {
                             ContinueListeningCard(
                                 conversation: continueItem.conversation,
@@ -127,26 +126,7 @@ struct LibraryView: View {
                     }
                 }
 
-                if !downloadedCalls.isEmpty {
-                    Section {
-                        Button {
-                            appState.tab = .downloads
-                        } label: {
-                            HStack {
-                                Label("Downloaded calls", systemImage: "arrow.down.circle.fill")
-                                    .foregroundStyle(.primary)
-                                Spacer()
-                                Text("\(downloadedCalls.count)")
-                                    .foregroundStyle(.secondary)
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.weight(.semibold))
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    }
-                }
-
-                recentCallSections
+                yourLibrarySection
             }
             .navigationTitle("Library")
             .refreshable {
@@ -162,65 +142,67 @@ struct LibraryView: View {
         }
     }
 
-    @ViewBuilder
-    private var recentCallSections: some View {
-        if conversations.isEmpty, !isLoading, errorMessage == nil {
-            Section {
-                ContentUnavailableView(
-                    "No calls yet",
-                    systemImage: "waveform",
-                    description: Text("Pull to refresh once your calls finish processing.")
-                )
-            }
-        } else {
-            ForEach(Array(groupConversationsByDate(conversations).enumerated()), id: \.offset) { _, group in
-                Section(group.label) {
-                    ForEach(group.items) { conversation in
-                        ConversationRow(
-                            conversation: conversation,
-                            isUnplayed: !playedIDs.contains(conversation.id),
-                            downloadedCall: downloadedByID[conversation.id]
-                        ) {
-                            Task { await player.play(conversation, queue: conversations) }
-                        }
-                        .swipeActions(edge: .trailing) {
-                            if let downloaded = downloadedByID[conversation.id] {
-                                Button(role: .destructive) {
-                                    downloads.delete(downloaded)
-                                } label: {
-                                    Label("Remove download", systemImage: "arrow.down.circle.dotted")
-                                }
-                            } else {
-                                Button {
-                                    Task { await downloads.download(conversation) }
-                                } label: {
-                                    Label("Download", systemImage: "arrow.down.circle")
-                                }
-                                .tint(.blue)
-                            }
-                            Button {
-                                player.enqueue([conversation])
-                            } label: {
-                                Label("Queue", systemImage: "text.badge.plus")
-                            }
-                            .tint(.indigo)
-                        }
-                        .task {
-                            if conversation.id == conversations.last?.id {
-                                await loadMoreIfNeeded()
-                            }
-                        }
+    /// Spotify-style collection: liked calls, playlists, and followed people.
+    private var yourLibrarySection: some View {
+        Section("Your Library") {
+            NavigationLink {
+                FavoriteCallsView()
+            } label: {
+                HStack {
+                    Label {
+                        Text("Favorites")
+                    } icon: {
+                        Image(systemName: "heart.fill")
+                            .foregroundStyle(.pink)
+                    }
+                    Spacer()
+                    if !favorites.isEmpty {
+                        Text("\(favorites.count)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
             }
-            if isLoading {
-                Section {
+
+            // Built-in "playlist" of every call, newest first.
+            NavigationLink {
+                NewCallsView()
+            } label: {
+                Label {
+                    Text("New Calls")
+                } icon: {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.indigo)
+                }
+            }
+
+            ForEach(playlists) { playlist in
+                NavigationLink {
+                    PlaylistDetailView(playlist: playlist)
+                } label: {
                     HStack {
+                        Label(playlist.name, systemImage: "music.note.list")
                         Spacer()
-                        ProgressView("Loading calls…")
-                        Spacer()
+                        Text("\(playlist.conversationIDs.count)")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
                     }
                 }
+            }
+
+            ForEach(followedArtists) { artist in
+                NavigationLink {
+                    ArtistDetailView(artist: artist)
+                } label: {
+                    Label(artist.name, systemImage: "person.circle")
+                }
+            }
+
+            NavigationLink {
+                FollowPeopleView()
+            } label: {
+                Label("Follow People", systemImage: "person.crop.circle.badge.plus")
+                    .foregroundStyle(.indigo)
             }
         }
     }
@@ -282,28 +264,170 @@ struct LibraryView: View {
             cachedConversations.first { $0.id == id }.map(Conversation.init(cache:))
     }
 
-    /// Most recently resumed unfinished call, skipping whatever is already loaded
-    /// in the mini player so the section never duplicates it.
+    /// What you're in the middle of: the call loaded in the player if there is
+    /// one, otherwise the most recently resumed unfinished call.
     private var continueListeningTarget: (conversation: Conversation, bookmark: PlaybackBookmark?)? {
-        let currentID = player.currentConversation?.id
+        if let current = player.currentConversation {
+            let bookmark = bookmarks.first { $0.conversationID == current.id }
+            return (current, bookmark)
+        }
         for bookmark in bookmarks {
-            guard bookmark.conversationID != currentID else { continue }
             // Treat calls within 30s of the end as finished.
             if bookmark.duration > 0, bookmark.position >= bookmark.duration - 30 { continue }
             if let conversation = conversation(for: bookmark.conversationID) {
                 return (conversation, bookmark)
             }
         }
-        // Nothing in progress: suggest the newest call, unless the player already has one loaded.
-        if currentID == nil {
-            if let conversation = conversations.first {
-                return (conversation, nil)
-            }
-            if let cached = cachedConversations.first {
-                return (Conversation(cache: cached), nil)
-            }
+        // Nothing in progress: suggest the newest call.
+        if let conversation = conversations.first {
+            return (conversation, nil)
+        }
+        if let cached = cachedConversations.first {
+            return (Conversation(cache: cached), nil)
         }
         return nil
+    }
+}
+
+/// Built-in "playlist" of every call, newest first. Not deletable — it's the
+/// firehose, pushed from the Library's collection list.
+struct NewCallsView: View {
+    @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var player: PlayerManager
+    @EnvironmentObject private var downloads: DownloadManager
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \CachedConversation.createdAt, order: .reverse) private var cachedConversations: [CachedConversation]
+    @Query private var bookmarks: [PlaybackBookmark]
+    @Query private var downloadedCalls: [DownloadedCall]
+    @Query private var favorites: [FavoriteCall]
+
+    @State private var conversations: [Conversation] = []
+    @State private var page = 1
+    @State private var pageCount = 1
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    private var playedIDs: Set<String> {
+        Set(bookmarks.map(\.conversationID))
+    }
+
+    private var downloadedByID: [String: DownloadedCall] {
+        Dictionary(downloadedCalls.map { ($0.conversationID, $0) }, uniquingKeysWith: { first, _ in first })
+    }
+
+    private var favoriteIDs: Set<String> {
+        Set(favorites.map(\.conversationID))
+    }
+
+    var body: some View {
+        List {
+            if let errorMessage {
+                Section {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.subheadline)
+                }
+            }
+
+            if conversations.isEmpty, !isLoading, errorMessage == nil {
+                Section {
+                    ContentUnavailableView(
+                        "No calls yet",
+                        systemImage: "waveform",
+                        description: Text("Pull to refresh once your calls finish processing.")
+                    )
+                }
+            } else {
+                ForEach(Array(groupConversationsByDate(conversations).enumerated()), id: \.offset) { _, group in
+                    Section(group.label) {
+                        ForEach(group.items) { conversation in
+                            ConversationRow(
+                                conversation: conversation,
+                                isUnplayed: !playedIDs.contains(conversation.id),
+                                downloadedCall: downloadedByID[conversation.id],
+                                isFavorite: favoriteIDs.contains(conversation.id),
+                                onToggleFavorite: { FavoritesStore.toggle(conversation, in: modelContext) }
+                            ) {
+                                Task { await player.play(conversation, queue: conversations) }
+                            }
+                            .swipeActions(edge: .trailing) {
+                                if let downloaded = downloadedByID[conversation.id] {
+                                    Button(role: .destructive) {
+                                        downloads.delete(downloaded)
+                                    } label: {
+                                        Label("Remove download", systemImage: "arrow.down.circle.dotted")
+                                    }
+                                } else {
+                                    Button {
+                                        Task { await downloads.download(conversation) }
+                                    } label: {
+                                        Label("Download", systemImage: "arrow.down.circle")
+                                    }
+                                    .tint(.blue)
+                                }
+                                Button {
+                                    player.enqueue([conversation])
+                                } label: {
+                                    Label("Queue", systemImage: "text.badge.plus")
+                                }
+                                .tint(.indigo)
+                            }
+                            .task {
+                                if conversation.id == conversations.last?.id {
+                                    await loadMore()
+                                }
+                            }
+                        }
+                    }
+                }
+                if isLoading {
+                    Section {
+                        HStack {
+                            Spacer()
+                            ProgressView("Loading calls…")
+                            Spacer()
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("New Calls")
+        .navigationBarTitleDisplayMode(.inline)
+        .task {
+            if conversations.isEmpty {
+                conversations = cachedConversations.map(Conversation.init(cache:))
+            }
+            await refresh()
+        }
+        .refreshable {
+            await refresh()
+        }
+    }
+
+    private func refresh() async {
+        page = 1
+        pageCount = 1
+        await loadMore(resetting: true)
+    }
+
+    private func loadMore(resetting: Bool = false) async {
+        guard !isLoading, page <= pageCount else { return }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            let result = try await appState.repository.list(page: page)
+            if resetting {
+                conversations = result.0
+            } else {
+                conversations.append(contentsOf: result.0)
+            }
+            pageCount = max(result.1?.pageCount ?? page, 1)
+            page += 1
+            errorMessage = nil
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
+            errorMessage = error.localizedDescription
+        }
     }
 }
 
@@ -312,9 +436,8 @@ struct SearchView: View {
     @EnvironmentObject private var player: PlayerManager
     @EnvironmentObject private var downloads: DownloadManager
     @Environment(\.modelContext) private var modelContext
-    @Query(sort: \RecentSearch.updatedAt, order: .reverse) private var recentSearches: [RecentSearch]
-    @Query(sort: \SuggestedEmail.updatedAt, order: .reverse) private var suggestedEmails: [SuggestedEmail]
     @Query private var downloadedCalls: [DownloadedCall]
+    @Query private var favorites: [FavoriteCall]
 
     @State private var titleQuery = ""
     @State private var participantEmails: [String] = []
@@ -341,7 +464,7 @@ struct SearchView: View {
 
     private var activeFilterCount: Int {
         participantEmails.count
-            + [dateRange != .all, hideInternal, callsIOwn].filter { $0 }.count
+            + [titleQuery.nilIfBlank != nil, dateRange != .all, hideInternal, callsIOwn].filter { $0 }.count
     }
 
     var body: some View {
@@ -362,18 +485,7 @@ struct SearchView: View {
                 resultsSections
             }
             .navigationTitle("Search")
-            .searchable(text: $titleQuery, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search call titles")
-            .searchSuggestions {
-                searchSuggestionsContent
-            }
-            .onSubmit(of: .search) {
-                runSearch()
-            }
-            .onChange(of: titleQuery) { _, newValue in
-                if newValue.isEmpty, hasSearched {
-                    runSearch()
-                }
-            }
+            .onChange(of: titleQuery) { _, _ in runSearch() }
             .onChange(of: participantEmails) { _, _ in runSearch() }
             .onChange(of: dateRange) { _, _ in runSearch() }
             .onChange(of: hideInternal) { _, _ in runSearch() }
@@ -390,6 +502,7 @@ struct SearchView: View {
             }
             .sheet(isPresented: $isShowingFilters) {
                 SearchFiltersSheet(
+                    titleQuery: $titleQuery,
                     participantEmails: $participantEmails,
                     dateRange: $dateRange,
                     hideInternal: $hideInternal,
@@ -427,40 +540,6 @@ struct SearchView: View {
                 .font(.subheadline)
                 .foregroundStyle(.secondary)
                 .buttonStyle(.plain)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var searchSuggestionsContent: some View {
-        if titleQuery.contains("@") {
-            // Typing an email routes to the participant filter instead of title search.
-            ForEach(EmailSuggestionStore.suggestions(matching: titleQuery, from: suggestedEmails)) { suggestion in
-                Button {
-                    addParticipant(suggestion.email)
-                    titleQuery = ""
-                } label: {
-                    Label {
-                        VStack(alignment: .leading, spacing: 2) {
-                            Text(suggestion.name ?? suggestion.email)
-                            if suggestion.name != nil {
-                                Text(suggestion.email)
-                                    .font(.caption)
-                                    .foregroundStyle(.secondary)
-                            }
-                        }
-                    } icon: {
-                        Image(systemName: "person.crop.circle")
-                    }
-                }
-            }
-        } else if titleQuery.isEmpty {
-            ForEach(recentSearches.prefix(6)) { item in
-                Button {
-                    applyRecentSearch(item.query)
-                } label: {
-                    Label(item.query, systemImage: "clock.arrow.circlepath")
-                }
             }
         }
     }
@@ -510,7 +589,9 @@ struct SearchView: View {
                         let downloaded = downloadedCalls.first { $0.conversationID == conversation.id }
                         ConversationRow(
                             conversation: conversation,
-                            downloadedCall: downloaded
+                            downloadedCall: downloaded,
+                            isFavorite: favorites.contains { $0.conversationID == conversation.id },
+                            onToggleFavorite: { FavoritesStore.toggle(conversation, in: modelContext) }
                         ) {
                             Task { await player.play(conversation, queue: results) }
                         }
@@ -568,29 +649,20 @@ struct SearchView: View {
 
     private func runSearch() {
         searchTask?.cancel()
-        searchTask = Task { await search(resetting: true) }
+        searchTask = Task {
+            // Debounce: the title field now searches as you type.
+            try? await Task.sleep(nanoseconds: 350_000_000)
+            guard !Task.isCancelled else { return }
+            await search(resetting: true)
+        }
     }
 
     private func clearAllFilters() {
+        titleQuery = ""
         participantEmails = []
         dateRange = .all
         hideInternal = false
         callsIOwn = false
-    }
-
-    private func addParticipant(_ email: String) {
-        let normalized = email.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
-        guard normalized.contains("@"), !participantEmails.contains(normalized) else { return }
-        participantEmails.append(normalized)
-    }
-
-    private func applyRecentSearch(_ value: String) {
-        if value.contains("@") {
-            addParticipant(value)
-        } else {
-            titleQuery = value
-            runSearch()
-        }
     }
 
     private func refreshEmailDirectory() async {
@@ -689,7 +761,8 @@ struct SearchView: View {
     }
 }
 
-struct DownloadsView: View {
+/// Shown as the Downloads tab and pushed from Settings ("Manage downloads").
+struct DownloadsListView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var player: PlayerManager
     @EnvironmentObject private var downloads: DownloadManager
@@ -697,8 +770,15 @@ struct DownloadsView: View {
     @State private var errorMessage: String?
 
     var body: some View {
-        NavigationStack {
             List {
+                if downloadedCalls.isEmpty, downloads.downloadingTitles.isEmpty {
+                    ContentUnavailableView(
+                        "No Downloads",
+                        systemImage: "arrow.down.circle",
+                        description: Text("Swipe a call in Library to save it for offline listening.")
+                    )
+                }
+
                 if !downloads.downloadingTitles.isEmpty {
                     Section("Downloading") {
                         ForEach(downloads.downloadingTitles.sorted(by: { $0.key < $1.key }), id: \.key) { _, title in
@@ -766,15 +846,6 @@ struct DownloadsView: View {
                 }
             }
             .navigationTitle("Downloads")
-            // Overlay instead of an inline row so deleting the last download lets the
-            // row's removal animation finish before the empty state fades in.
-            .overlay {
-                if downloadedCalls.isEmpty, downloads.downloadingTitles.isEmpty {
-                    ContentUnavailableView("No Downloads", systemImage: "arrow.down.circle", description: Text("Swipe a call in Library to save it for offline listening."))
-                        .transition(.opacity)
-                }
-            }
-            .animation(.easeInOut(duration: 0.3).delay(0.35), value: downloadedCalls.isEmpty)
             .alert("Download Error", isPresented: Binding(
                 get: { errorMessage != nil || downloads.errorMessage != nil },
                 set: {
@@ -788,7 +859,6 @@ struct DownloadsView: View {
             } message: {
                 Text(errorMessage ?? downloads.errorMessage ?? "")
             }
-        }
     }
 
     private var totalSize: Int64 {
@@ -818,11 +888,691 @@ struct DownloadsView: View {
     }
 }
 
+struct SnippetsView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \SavedSnippet.createdAt, order: .reverse) private var snippets: [SavedSnippet]
+    @Query(sort: \SnippetFolder.name) private var folders: [SnippetFolder]
+    @State private var selectedSnippet: SavedSnippet?
+    @State private var isNamingFolder = false
+    @State private var newFolderName = ""
+
+    private var unfiledSnippets: [SavedSnippet] {
+        snippets.filter { $0.localFolder.isEmpty }
+    }
+
+    var body: some View {
+        NavigationStack {
+            List {
+                foldersSection
+                snippetsSection
+            }
+            .navigationTitle("Snippets")
+            .toolbar {
+                ToolbarItem(placement: .primaryAction) {
+                    Button {
+                        newFolderName = ""
+                        isNamingFolder = true
+                    } label: {
+                        Image(systemName: "folder.badge.plus")
+                    }
+                    .accessibilityLabel("New Folder")
+                }
+            }
+            .sheet(item: $selectedSnippet) { snippet in
+                SnippetPlayerView(snippet: snippet)
+            }
+            .alert("New Folder", isPresented: $isNamingFolder) {
+                TextField("Folder name", text: $newFolderName)
+                Button("Cancel", role: .cancel) {}
+                Button("Create") {
+                    createFolder(named: newFolderName)
+                }
+            } message: {
+                Text("Folders live on this phone and help organize your snippets.")
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var foldersSection: some View {
+        if !folders.isEmpty {
+            Section("Folders") {
+                ForEach(folders) { folder in
+                    NavigationLink {
+                        SnippetFolderView(folder: folder)
+                    } label: {
+                        HStack {
+                            Label(folder.name, systemImage: "folder")
+                            Spacer()
+                            let count = snippets.count { $0.localFolder == folder.name }
+                            if count > 0 {
+                                Text("\(count)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var snippetsSection: some View {
+        if snippets.isEmpty {
+            ContentUnavailableView(
+                "No Snippets",
+                systemImage: "scissors",
+                description: Text("Create a snippet from the player and it shows up here with its share link.")
+            )
+        } else {
+            Section {
+                if unfiledSnippets.isEmpty {
+                    Text("All snippets are filed in folders.")
+                        .font(.subheadline)
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(unfiledSnippets) { snippet in
+                    SnippetRow(snippet: snippet, folders: folders) {
+                        selectedSnippet = snippet
+                    }
+                }
+            } header: {
+                Text("My Snippets")
+            }
+        }
+    }
+
+    private func createFolder(named rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, !folders.contains(where: { $0.name == name }) else { return }
+        modelContext.insert(SnippetFolder(name: name))
+        try? modelContext.save()
+        Haptics.success()
+    }
+}
+
+/// One local folder's snippets, with rename and delete.
+struct SnippetFolderView: View {
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    @Query(sort: \SavedSnippet.createdAt, order: .reverse) private var allSnippets: [SavedSnippet]
+    @Query(sort: \SnippetFolder.name) private var folders: [SnippetFolder]
+
+    let folder: SnippetFolder
+
+    @State private var selectedSnippet: SavedSnippet?
+    @State private var isRenaming = false
+    @State private var renameText = ""
+    @State private var isConfirmingDelete = false
+
+    private var snippetsHere: [SavedSnippet] {
+        allSnippets.filter { $0.localFolder == folder.name }
+    }
+
+    var body: some View {
+        List {
+            if snippetsHere.isEmpty {
+                ContentUnavailableView(
+                    "Empty Folder",
+                    systemImage: "folder",
+                    description: Text("Move snippets here from their long-press menu, or pick this folder when saving a new snippet.")
+                )
+            }
+            ForEach(snippetsHere) { snippet in
+                SnippetRow(snippet: snippet, folders: folders) {
+                    selectedSnippet = snippet
+                }
+            }
+        }
+        .navigationTitle(folder.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button {
+                        renameText = folder.name
+                        isRenaming = true
+                    } label: {
+                        Label("Rename", systemImage: "pencil")
+                    }
+                    Button(role: .destructive) {
+                        isConfirmingDelete = true
+                    } label: {
+                        Label("Delete Folder", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+            }
+        }
+        .sheet(item: $selectedSnippet) { snippet in
+            SnippetPlayerView(snippet: snippet)
+        }
+        .alert("Rename Folder", isPresented: $isRenaming) {
+            TextField("Folder name", text: $renameText)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") {
+                renameFolder(to: renameText)
+            }
+        }
+        .alert("Delete “\(folder.name)”?", isPresented: $isConfirmingDelete) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                deleteFolder()
+            }
+        } message: {
+            Text("Snippets inside move back to My Snippets.")
+        }
+    }
+
+    private func renameFolder(to rawName: String) {
+        let name = rawName.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !name.isEmpty, name != folder.name,
+              !folders.contains(where: { $0.name == name }) else { return }
+        for snippet in snippetsHere {
+            snippet.localFolder = name
+        }
+        folder.name = name
+        try? modelContext.save()
+    }
+
+    private func deleteFolder() {
+        for snippet in snippetsHere {
+            snippet.localFolder = ""
+        }
+        modelContext.delete(folder)
+        try? modelContext.save()
+        dismiss()
+    }
+}
+
+/// Shared snippet row: tap to open the snippet player, long-press or swipe for
+/// copy/share/move/delete.
+struct SnippetRow: View {
+    @EnvironmentObject private var player: PlayerManager
+    @Environment(\.modelContext) private var modelContext
+
+    let snippet: SavedSnippet
+    let folders: [SnippetFolder]
+    let onOpen: () -> Void
+
+    var body: some View {
+        Button(action: onOpen) {
+            VStack(alignment: .leading, spacing: 4) {
+                Text(snippet.title)
+                    .font(.headline)
+                    .lineLimit(2)
+                Text(snippet.callTitle)
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                if !snippet.notes.isEmpty {
+                    Text(snippet.notes)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(2)
+                        .italic()
+                }
+                HStack(spacing: 6) {
+                    Image(systemName: "scissors")
+                    Text((snippet.endTime - snippet.startTime).shortDuration)
+                    Text("·")
+                    Text("starts at \(snippet.startTime.shortDuration)")
+                    Text("·")
+                    Text(snippet.createdAt.compactRelativeLabel)
+                }
+                .font(.caption)
+                .foregroundStyle(.secondary)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .contextMenu {
+            if let url = snippet.url {
+                Button("Copy link", systemImage: "link") {
+                    UIPasteboard.general.string = snippet.urlString
+                    UIPasteboard.general.url = url
+                    Haptics.success()
+                }
+                ShareLink(item: url) {
+                    Label("Share", systemImage: "square.and.arrow.up")
+                }
+            }
+            Button("Play in call", systemImage: "play.circle") {
+                playSource()
+            }
+            moveToFolderMenu
+            Button("Remove from list", systemImage: "trash", role: .destructive) {
+                modelContext.delete(snippet)
+                try? modelContext.save()
+            }
+        }
+        .swipeActions(edge: .trailing) {
+            Button(role: .destructive) {
+                modelContext.delete(snippet)
+                try? modelContext.save()
+            } label: {
+                Label("Remove", systemImage: "trash")
+            }
+        }
+        .swipeActions(edge: .leading) {
+            if snippet.url != nil {
+                Button {
+                    UIPasteboard.general.string = snippet.urlString
+                    Haptics.success()
+                } label: {
+                    Label("Copy link", systemImage: "link")
+                }
+                .tint(.indigo)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var moveToFolderMenu: some View {
+        if !folders.isEmpty {
+            Menu {
+                ForEach(folders) { folder in
+                    Button {
+                        snippet.localFolder = folder.name
+                        try? modelContext.save()
+                        Haptics.tap()
+                    } label: {
+                        if snippet.localFolder == folder.name {
+                            Label(folder.name, systemImage: "checkmark")
+                        } else {
+                            Text(folder.name)
+                        }
+                    }
+                }
+                if !snippet.localFolder.isEmpty {
+                    Button("Remove from folder", systemImage: "folder.badge.minus") {
+                        snippet.localFolder = ""
+                        try? modelContext.save()
+                    }
+                }
+            } label: {
+                Label("Move to Folder", systemImage: "folder")
+            }
+        }
+    }
+
+    /// Opens the source call and starts playback at the snippet's start.
+    private func playSource() {
+        Haptics.tap()
+        let conversation = Conversation(
+            id: snippet.conversationID,
+            title: snippet.callTitle,
+            createdAt: snippet.createdAt,
+            duration: 0
+        )
+        Task {
+            await player.play(conversation)
+            player.seek(to: snippet.startTime)
+        }
+    }
+}
+
+/// Trailing ⓧ shown inside text fields whenever there's something to clear.
+struct ClearButton: View {
+    @Binding var text: String
+
+    var body: some View {
+        if !text.isEmpty {
+            Button {
+                text = ""
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+                    .foregroundStyle(.secondary)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+}
+
+/// Standalone audio engine for a single snippet. Deliberately separate from
+/// PlayerManager so previewing a clip never unloads or reseats the call in the
+/// main player (mini bar, lock screen, bookmarks all stay untouched).
+@MainActor
+final class SnippetClipPlayer: ObservableObject {
+    @Published private(set) var isPlaying = false
+    /// Absolute position in the source call's timeline.
+    @Published private(set) var position: TimeInterval = 0
+
+    private var player: AVPlayer?
+    private var timeObserver: Any?
+    private var window: ClosedRange<TimeInterval> = 0...1
+
+    func load(url: URL, start: TimeInterval, end: TimeInterval) {
+        teardown()
+        window = start...max(start + 0.1, end)
+        position = start
+        let player = AVPlayer(url: url)
+        player.seek(to: CMTime(seconds: start, preferredTimescale: 600))
+        timeObserver = player.addPeriodicTimeObserver(
+            forInterval: CMTime(seconds: 0.25, preferredTimescale: 600),
+            queue: .main
+        ) { [weak self] time in
+            Task { @MainActor in
+                guard let self else { return }
+                self.position = time.seconds
+                if time.seconds >= self.window.upperBound {
+                    self.pause()
+                }
+            }
+        }
+        self.player = player
+    }
+
+    func play() {
+        guard let player else { return }
+        // Restart from the top if the clip already ran out.
+        if position >= window.upperBound - 0.25 {
+            seek(to: window.lowerBound)
+        }
+        try? AVAudioSession.sharedInstance().setActive(true)
+        player.play()
+        isPlaying = true
+    }
+
+    func pause() {
+        player?.pause()
+        isPlaying = false
+    }
+
+    func seek(to seconds: TimeInterval) {
+        let bounded = min(max(seconds, window.lowerBound), window.upperBound)
+        position = bounded
+        player?.seek(to: CMTime(seconds: bounded, preferredTimescale: 600))
+    }
+
+    func restart() {
+        seek(to: window.lowerBound)
+        if !isPlaying { play() }
+    }
+
+    func teardown() {
+        if let timeObserver, let player {
+            player.removeTimeObserver(timeObserver)
+        }
+        player?.pause()
+        player = nil
+        timeObserver = nil
+        isPlaying = false
+    }
+}
+
+/// Player scoped to a single snippet: plays just [start, end] on its own audio
+/// engine and stops. The main player is only touched via the explicit expand button.
+struct SnippetPlayerView: View {
+    @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var player: PlayerManager
+    @EnvironmentObject private var downloads: DownloadManager
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    @Query private var downloadedCalls: [DownloadedCall]
+    let snippet: SavedSnippet
+
+    @StateObject private var clip = SnippetClipPlayer()
+    @State private var isLoading = true
+    @State private var loadError: String?
+    @State private var scrubTime: TimeInterval?
+    @State private var isEditingNote = false
+    @State private var noteDraft = ""
+
+    private var windowLength: TimeInterval {
+        max(0.1, snippet.endTime - snippet.startTime)
+    }
+
+    /// Current position clamped into the snippet window, window-relative.
+    private var windowPosition: TimeInterval {
+        min(max(clip.position, snippet.startTime), snippet.endTime) - snippet.startTime
+    }
+
+    var body: some View {
+        NavigationStack {
+            // Top-aligned with a fixed rhythm (no stretching Spacers) so the
+            // layout reads the same at the half and full detents.
+            VStack(spacing: 28) {
+                VStack(spacing: 12) {
+                    Image(systemName: "scissors")
+                        .font(.system(size: 32))
+                        .foregroundStyle(.indigo)
+                    VStack(spacing: 4) {
+                        Text(snippet.title)
+                            .font(.headline)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                        Text(snippet.callTitle)
+                            .font(.subheadline)
+                            .foregroundStyle(.secondary)
+                            .lineLimit(1)
+                        noteRow
+                    }
+                }
+                .padding(.horizontal, 24)
+
+                if let loadError {
+                    Label(loadError, systemImage: "exclamationmark.triangle.fill")
+                        .font(.subheadline)
+                        .foregroundStyle(.orange)
+                } else if isLoading {
+                    ProgressView("Loading snippet…")
+                        .padding(.top, 12)
+                } else {
+                    VStack(spacing: 22) {
+                        VStack(spacing: 8) {
+                            Slider(
+                                value: Binding(
+                                    get: { scrubTime ?? windowPosition },
+                                    set: { scrubTime = $0 }
+                                ),
+                                in: 0...windowLength
+                            ) { editing in
+                                guard !editing, let scrubTime else { return }
+                                clip.seek(to: snippet.startTime + scrubTime)
+                                self.scrubTime = nil
+                            }
+                            HStack {
+                                Text((scrubTime ?? windowPosition).shortDuration)
+                                Spacer()
+                                Text(windowLength.shortDuration)
+                            }
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        }
+
+                        HStack(spacing: 44) {
+                            Button {
+                                Haptics.tap()
+                                clip.restart()
+                            } label: {
+                                Image(systemName: "arrow.counterclockwise")
+                                    .font(.title2)
+                            }
+                            Button {
+                                Haptics.tap()
+                                if clip.isPlaying {
+                                    clip.pause()
+                                } else {
+                                    if player.isPlaying { player.pause() }
+                                    clip.play()
+                                }
+                            } label: {
+                                Image(systemName: clip.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                    .font(.system(size: 60))
+                            }
+                            Button(action: expandToFullCall) {
+                                Image(systemName: "rectangle.expand.vertical")
+                                    .font(.title2)
+                            }
+                        }
+                        .foregroundStyle(.indigo)
+                    }
+                    .padding(.horizontal, 24)
+                }
+
+                Spacer(minLength: 0)
+            }
+            .padding(.top, 20)
+            .navigationTitle("Snippet")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Done") { dismiss() }
+                }
+            }
+            // Anchored to the sheet's bottom safe area, so the buttons keep a
+            // comfortable inset at every detent instead of hugging the edge.
+            .safeAreaInset(edge: .bottom) {
+                if let url = snippet.url {
+                    HStack(spacing: 12) {
+                        Button {
+                            UIPasteboard.general.string = snippet.urlString
+                            UIPasteboard.general.url = url
+                            Haptics.success()
+                        } label: {
+                            Label("Copy link", systemImage: "link")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        ShareLink(item: url) {
+                            Label("Share", systemImage: "square.and.arrow.up")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                    }
+                    .controlSize(.large)
+                    .padding(.horizontal, 24)
+                    .padding(.top, 8)
+                    .padding(.bottom, 12)
+                }
+            }
+            .task {
+                await loadAndPlay()
+            }
+            .onDisappear {
+                clip.teardown()
+            }
+            .sheet(isPresented: $isEditingNote) {
+                noteEditor
+            }
+        }
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+    }
+
+    private var noteEditor: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    HStack(alignment: .top) {
+                        TextField("Note", text: $noteDraft, axis: .vertical)
+                            .lineLimit(3...8)
+                        ClearButton(text: $noteDraft)
+                    }
+                } footer: {
+                    Text("Saved on this phone. The shared web clip keeps the note it was created with.")
+                }
+            }
+            .navigationTitle("Snippet Note")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { isEditingNote = false }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        snippet.notes = noteDraft.trimmingCharacters(in: .whitespacesAndNewlines)
+                        try? modelContext.save()
+                        Haptics.success()
+                        isEditingNote = false
+                    }
+                }
+            }
+        }
+        .presentationDetents([.medium])
+        .presentationDragIndicator(.visible)
+    }
+
+    @ViewBuilder
+    private var noteRow: some View {
+        Button {
+            noteDraft = snippet.notes
+            isEditingNote = true
+        } label: {
+            if snippet.notes.isEmpty {
+                Label("Add note", systemImage: "square.and.pencil")
+                    .font(.footnote)
+            } else {
+                HStack(alignment: .firstTextBaseline, spacing: 5) {
+                    Text(snippet.notes)
+                        .font(.footnote)
+                        .italic()
+                        .multilineTextAlignment(.center)
+                        .lineLimit(3)
+                    Image(systemName: "pencil")
+                        .font(.caption2)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+        .padding(.top, 2)
+    }
+
+    private func loadAndPlay() async {
+        do {
+            let url: URL
+            if let download = downloadedCalls.first(where: { $0.conversationID == snippet.conversationID }),
+               let local = try? downloads.localURL(for: download) {
+                url = local
+            } else {
+                url = try await appState.repository.mediaURL(for: snippet.conversationID)
+            }
+            clip.load(url: url, start: snippet.startTime, end: snippet.endTime)
+            isLoading = false
+            // Don't talk over the main player; pause it (state preserved) and play the clip.
+            if player.isPlaying { player.pause() }
+            clip.play()
+        } catch {
+            loadError = "Couldn't load the snippet audio."
+            isLoading = false
+        }
+    }
+
+    /// The one deliberate handoff: load the source call into the main player
+    /// and continue from wherever the clip was.
+    private func expandToFullCall() {
+        Haptics.tap()
+        let target = snippet.startTime + windowPosition
+        clip.teardown()
+        let conversation = Conversation(
+            id: snippet.conversationID,
+            title: snippet.callTitle,
+            createdAt: snippet.createdAt,
+            duration: 0
+        )
+        dismiss()
+        appState.presentNowPlaying = true
+        Task {
+            if player.currentConversation?.id != snippet.conversationID {
+                await player.play(conversation)
+            }
+            player.seek(to: target)
+        }
+    }
+}
+
 struct SearchFiltersSheet: View {
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
     @Query(sort: \SuggestedEmail.updatedAt, order: .reverse) private var suggestedEmails: [SuggestedEmail]
 
+    @Binding var titleQuery: String
     @Binding var participantEmails: [String]
     @Binding var dateRange: LibraryDateRange
     @Binding var hideInternal: Bool
@@ -839,6 +1589,22 @@ struct SearchFiltersSheet: View {
     var body: some View {
         NavigationStack {
             Form {
+                Section("Call title") {
+                    HStack {
+                        TextField("Search call titles", text: $titleQuery)
+                            .autocorrectionDisabled()
+                        if !titleQuery.isEmpty {
+                            Button {
+                                titleQuery = ""
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                                    .foregroundStyle(.secondary)
+                            }
+                            .buttonStyle(.plain)
+                        }
+                    }
+                }
+
                 Section("Participants") {
                     ForEach(participantEmails, id: \.self) { email in
                         HStack {
@@ -857,13 +1623,16 @@ struct SearchFiltersSheet: View {
                         }
                     }
 
-                    TextField(participantEmails.isEmpty ? "Participant email" : "Add another participant", text: $emailDraft)
-                        .textInputAutocapitalization(.never)
-                        .keyboardType(.emailAddress)
-                        .autocorrectionDisabled()
-                        .focused($emailFocused)
-                        .submitLabel(.return)
-                        .onSubmit { commitEmail(emailDraft) }
+                    HStack {
+                        TextField(participantEmails.isEmpty ? "Participant email" : "Add another participant", text: $emailDraft)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.emailAddress)
+                            .autocorrectionDisabled()
+                            .focused($emailFocused)
+                            .submitLabel(.return)
+                            .onSubmit { commitEmail(emailDraft) }
+                        ClearButton(text: $emailDraft)
+                    }
 
                     if emailFocused {
                         ForEach(emailSuggestions) { suggestion in
@@ -911,6 +1680,7 @@ struct SearchFiltersSheet: View {
 
                 Section {
                     Button("Clear all filters", role: .destructive) {
+                        titleQuery = ""
                         emailDraft = ""
                         participantEmails = []
                         dateRange = .all
@@ -1110,11 +1880,14 @@ struct SettingsView: View {
 
     private var profileSection: some View {
         Section {
-            TextField("My email", text: $draftEmail)
-                .textInputAutocapitalization(.never)
-                .keyboardType(.emailAddress)
-                .autocorrectionDisabled()
-                .focused($emailFocused)
+            HStack {
+                TextField("My email", text: $draftEmail)
+                    .textInputAutocapitalization(.never)
+                    .keyboardType(.emailAddress)
+                    .autocorrectionDisabled()
+                    .focused($emailFocused)
+                ClearButton(text: $draftEmail)
+            }
             ForEach(emailSuggestions, id: \.email) { suggestion in
                 Button {
                     saveEmail(suggestion.email)
@@ -1184,20 +1957,16 @@ struct SettingsView: View {
 
     private var storageSection: some View {
         Section("Storage") {
-            Button {
-                appState.tab = .downloads
+            NavigationLink {
+                DownloadsListView()
             } label: {
                 HStack {
                     Label("Manage downloads", systemImage: "arrow.down.circle")
                     Spacer()
                     Text("\(downloadedCalls.count) · \(formattedSize(downloadedCalls.reduce(0) { $0 + $1.fileSize }))")
                         .foregroundStyle(.secondary)
-                    Image(systemName: "chevron.right")
-                        .font(.caption)
-                        .foregroundStyle(.tertiary)
                 }
             }
-            .buttonStyle(.plain)
             LabeledContent("Cached calls", value: "\(cachedConversations.count)")
             Button("Clear Local Cache", role: .destructive) {
                 isConfirmingClearCache = true
@@ -1438,6 +2207,11 @@ struct NowPlayingView: View {
     @EnvironmentObject private var player: PlayerManager
     @EnvironmentObject private var appState: AppState
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.playlists) private var playlists
+    @Query private var favorites: [FavoriteCall]
+    @State private var isNamingPlaylist = false
+    @State private var newPlaylistName = ""
     @State private var isShowingDetail = false
     @State private var isShowingAsk = false
     @State private var isShowingQueue = false
@@ -1590,6 +2364,57 @@ struct NowPlayingView: View {
                 participantsMenu
             }
             Spacer(minLength: 0)
+            if let conversation = player.currentConversation {
+                let isFavorite = favorites.contains { $0.conversationID == conversation.id }
+                Button {
+                    Haptics.tap()
+                    FavoritesStore.toggle(conversation, in: modelContext)
+                } label: {
+                    Image(systemName: isFavorite ? "heart.fill" : "heart")
+                        .font(.title3)
+                        .foregroundStyle(isFavorite ? .pink : .secondary)
+                }
+                Menu {
+                    ForEach(playlists) { playlist in
+                        Button {
+                            playlist.toggle(conversation)
+                            try? modelContext.save()
+                            Haptics.tap()
+                        } label: {
+                            if playlist.contains(conversation.id) {
+                                Label(playlist.name, systemImage: "checkmark")
+                            } else {
+                                Text(playlist.name)
+                            }
+                        }
+                    }
+                    Button {
+                        newPlaylistName = ""
+                        isNamingPlaylist = true
+                    } label: {
+                        Label("New Playlist…", systemImage: "plus")
+                    }
+                } label: {
+                    Image(systemName: "music.note.list")
+                        .font(.title3)
+                        .foregroundStyle(.secondary)
+                }
+            }
+        }
+        .alert("New Playlist", isPresented: $isNamingPlaylist) {
+            TextField("Playlist name", text: $newPlaylistName)
+            Button("Cancel", role: .cancel) {}
+            Button("Create") {
+                let name = newPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty, let conversation = player.currentConversation else { return }
+                let playlist = Playlist(name: name)
+                playlist.toggle(conversation)
+                modelContext.insert(playlist)
+                try? modelContext.save()
+                Haptics.success()
+            }
+        } message: {
+            Text("“\(player.currentConversation?.title ?? "This call")” will be added to it.")
         }
     }
 
@@ -1732,8 +2557,15 @@ struct NowPlayingView: View {
                     Haptics.tap()
                     player.playPause()
                 } label: {
-                    Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                        .font(.system(size: 58))
+                    // Invisible caption mirrors the transport buttons' layout so
+                    // all icons share the same vertical center.
+                    VStack(spacing: 3) {
+                        Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                            .font(.system(size: 58))
+                        Text(" ")
+                            .font(.system(size: 9, weight: .medium))
+                            .hidden()
+                    }
                 }
                 transportButton(icon: "goforward.\(Int(player.skipInterval))", caption: "\(Int(player.skipInterval))s") {
                     player.skip(by: player.skipInterval)
@@ -1993,10 +2825,14 @@ struct TranscriptView: View {
                         }
                 )
 
-                if !followPlayback, !selection.isSelecting, player.activeSegment() != nil {
+                if !followPlayback, !selection.isSelecting, !player.currentTranscript.isEmpty {
                     Button {
                         followPlayback = true
-                        scrollRequestID = player.activeSegment()?.id
+                        // last(where:) not activeSegment(): the playhead often sits
+                        // in a silence gap between segments, where activeSegment()
+                        // is nil and the jump would silently go nowhere.
+                        scrollRequestID = player.currentTranscript.last(where: { $0.startTime <= player.currentTime })?.id
+                            ?? player.currentTranscript.first?.id
                     } label: {
                         Label("Jump to current", systemImage: "text.aligncenter")
                             .font(.caption.weight(.semibold))
@@ -2090,8 +2926,77 @@ struct TranscriptSegmentView: View, Equatable {
     }
 
     var body: some View {
-        Button(action: onTap) {
-            VStack(alignment: .leading, spacing: 6) {
+        // Not a Button: a wrapping button would swallow taps meant for the ⋮
+        // menu, and .contextMenu would lift the (sometimes huge) bubble into a
+        // translucent preview. Tap gesture on the bubble, real Menu inside.
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Circle()
+                    .fill(speakerColor)
+                    .frame(width: 8, height: 8)
+                Text(segment.speaker?.displayName ?? "Unknown")
+                    .font(.caption.bold())
+                    .foregroundStyle(speakerColor)
+                if segment.speaker?.type == "internal" {
+                    Text("Internal")
+                        .font(.caption2.bold())
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(.indigo.opacity(0.15), in: Capsule())
+                }
+                Spacer()
+                Text(segment.startTime.shortDuration)
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Menu {
+                    Button("Copy", systemImage: "doc.on.doc", action: onCopy)
+                    Button("Create snippet", systemImage: "scissors", action: onCreateSnippet)
+                    Button("Select range…", systemImage: "selection.pin.in.out", action: onStartRange)
+                } label: {
+                    Image(systemName: "ellipsis")
+                        .font(.caption.bold())
+                        .foregroundStyle(.secondary)
+                        .padding(6)
+                        .contentShape(Rectangle())
+                }
+            }
+            FlowLayout(alignment: .leading, spacing: 4) {
+                ForEach(segment.words) { word in
+                    Text(word.text)
+                        .font(.body)
+                        // Highlight drawn outside the text bounds so the
+                        // active word never shifts the layout.
+                        .background(
+                            RoundedRectangle(cornerRadius: 4)
+                                .fill(wordBackground(word))
+                                .padding(-2)
+                        )
+                        // Scroll anchor so follow mode can track the active
+                        // word through long monologue blocks.
+                        .id(word.id)
+                }
+            }
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .fill(isSelected ? Color.indigo.opacity(0.16) : Color.secondary.opacity(0.08))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 14, style: .continuous)
+                .stroke(strokeColor, lineWidth: 2)
+        )
+        .contentShape(Rectangle())
+        .onTapGesture(perform: onTap)
+        // Custom preview: long-pressing a huge monologue bubble no longer lifts
+        // the whole thing into a screen-filling translucent copy — it shows a
+        // compact card instead (same pattern as link previews in Messages).
+        .contextMenu {
+            Button("Copy", systemImage: "doc.on.doc", action: onCopy)
+            Button("Create snippet", systemImage: "scissors", action: onCreateSnippet)
+            Button("Select range…", systemImage: "selection.pin.in.out", action: onStartRange)
+        } preview: {
+            VStack(alignment: .leading, spacing: 8) {
                 HStack {
                     Circle()
                         .fill(speakerColor)
@@ -2099,60 +3004,17 @@ struct TranscriptSegmentView: View, Equatable {
                     Text(segment.speaker?.displayName ?? "Unknown")
                         .font(.caption.bold())
                         .foregroundStyle(speakerColor)
-                    if segment.speaker?.type == "internal" {
-                        Text("Internal")
-                            .font(.caption2.bold())
-                            .padding(.horizontal, 6)
-                            .padding(.vertical, 2)
-                            .background(.indigo.opacity(0.15), in: Capsule())
-                    }
                     Spacer()
                     Text(segment.startTime.shortDuration)
                         .font(.caption.monospacedDigit())
                         .foregroundStyle(.secondary)
-                    Menu {
-                        Button("Copy", systemImage: "doc.on.doc", action: onCopy)
-                        Button("Create snippet", systemImage: "scissors", action: onCreateSnippet)
-                        Button("Select range…", systemImage: "selection.pin.in.out", action: onStartRange)
-                    } label: {
-                        Image(systemName: "ellipsis")
-                            .font(.caption.bold())
-                            .foregroundStyle(.secondary)
-                            .padding(6)
-                    }
                 }
-                FlowLayout(alignment: .leading, spacing: 4) {
-                    ForEach(segment.words) { word in
-                        Text(word.text)
-                            .font(.body)
-                            // Highlight drawn outside the text bounds so the
-                            // active word never shifts the layout.
-                            .background(
-                                RoundedRectangle(cornerRadius: 4)
-                                    .fill(wordBackground(word))
-                                    .padding(-2)
-                            )
-                            // Scroll anchor so follow mode can track the active
-                            // word through long monologue blocks.
-                            .id(word.id)
-                    }
-                }
+                Text(segment.text)
+                    .font(.subheadline)
+                    .lineLimit(6)
             }
-            .padding(12)
-            .background(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .fill(isSelected ? Color.indigo.opacity(0.16) : Color.secondary.opacity(0.08))
-            )
-            .overlay(
-                RoundedRectangle(cornerRadius: 14, style: .continuous)
-                    .stroke(strokeColor, lineWidth: 2)
-            )
-        }
-        .buttonStyle(.plain)
-        .contextMenu {
-            Button("Copy", systemImage: "doc.on.doc", action: onCopy)
-            Button("Create snippet", systemImage: "scissors", action: onCreateSnippet)
-            Button("Select range…", systemImage: "selection.pin.in.out", action: onStartRange)
+            .padding(16)
+            .frame(width: 320, alignment: .leading)
         }
     }
 
@@ -2248,7 +3110,7 @@ struct WordSelectionView: View {
     @Binding var start: TimeInterval
     @Binding var end: TimeInterval
 
-    @State private var padBefore: TimeInterval = 30
+    @State private var padBefore: TimeInterval = 15
     @State private var padAfter: TimeInterval = 30
 
     private var windowStart: TimeInterval { max(0, start - padBefore) }
@@ -2256,6 +3118,16 @@ struct WordSelectionView: View {
 
     private var visibleSegments: [TranscriptSegment] {
         segments.filter { $0.endTime >= windowStart && $0.startTime <= windowEnd }
+    }
+
+    /// Anchor for auto-scrolling the selection into view.
+    private var firstSelectedWordID: String? {
+        for segment in visibleSegments {
+            if let word = segment.words.first(where: { $0.endTimestamp >= start && $0.startTimestamp <= end }) {
+                return word.id
+            }
+        }
+        return nil
     }
 
     var body: some View {
@@ -2268,26 +3140,36 @@ struct WordSelectionView: View {
             }
             .buttonStyle(.borderless)
 
-            ScrollView {
-                VStack(alignment: .leading, spacing: 14) {
-                    ForEach(visibleSegments) { segment in
-                        VStack(alignment: .leading, spacing: 4) {
-                            if let name = segment.speaker?.displayName {
-                                Text(name)
-                                    .font(.caption.bold())
-                                    .foregroundStyle(.secondary)
-                            }
-                            FlowLayout(alignment: .leading, spacing: 4) {
-                                ForEach(visibleWords(in: segment)) { word in
-                                    wordView(word)
+            ScrollViewReader { proxy in
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 14) {
+                        ForEach(visibleSegments) { segment in
+                            VStack(alignment: .leading, spacing: 4) {
+                                if let name = segment.speaker?.displayName {
+                                    Text(name)
+                                        .font(.caption.bold())
+                                        .foregroundStyle(.secondary)
+                                }
+                                FlowLayout(alignment: .leading, spacing: 4) {
+                                    ForEach(visibleWords(in: segment)) { word in
+                                        wordView(word)
+                                            .id(word.id)
+                                    }
                                 }
                             }
                         }
                     }
+                    .padding(.vertical, 2)
                 }
-                .padding(.vertical, 2)
+                .frame(maxHeight: 280)
+                // Open with the selection in view, not the lead-in context above it.
+                .onAppear {
+                    guard let id = firstSelectedWordID else { return }
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
+                        proxy.scrollTo(id, anchor: UnitPoint(x: 0, y: 0.12))
+                    }
+                }
             }
-            .frame(maxHeight: 280)
 
             Button {
                 padAfter += 60
@@ -2333,120 +3215,11 @@ struct WordSelectionView: View {
     }
 }
 
-/// Browses the Attention snippet library folder tree, loading one level at a time.
-struct LibraryFolderPickerView: View {
-    @EnvironmentObject private var appState: AppState
-    @Environment(\.dismiss) private var dismiss
-
-    let userUUID: String
-    let myLibrary: Bool
-    let onSelect: (String) -> Void
-
-    private struct Crumb: Hashable {
-        let uuid: String
-        let name: String
-    }
-
-    @State private var crumbs: [Crumb] = []
-    @State private var subfolders: [LibrarySubFolder] = []
-    @State private var isLoading = false
-    @State private var loadError: String?
-
-    private var currentPath: String {
-        crumbs.map { "/" + $0.name }.joined()
-    }
-
-    var body: some View {
-        NavigationStack {
-            List {
-                Section {
-                    Button {
-                        onSelect(currentPath)
-                        dismiss()
-                    } label: {
-                        Label(
-                            crumbs.isEmpty ? "Use root folder" : "Use “\(crumbs.last?.name ?? "")”",
-                            systemImage: "checkmark.circle.fill"
-                        )
-                    }
-                }
-
-                Section(crumbs.isEmpty ? "Folders" : currentPath) {
-                    if isLoading {
-                        HStack(spacing: 10) {
-                            ProgressView()
-                            Text("Loading folders…").foregroundStyle(.secondary)
-                        }
-                    } else if let loadError {
-                        Text(loadError).foregroundStyle(.secondary)
-                    } else if subfolders.isEmpty {
-                        Text("No subfolders").foregroundStyle(.secondary)
-                    }
-                    ForEach(subfolders) { folder in
-                        Button {
-                            crumbs.append(Crumb(uuid: folder.uuid, name: folder.name))
-                        } label: {
-                            HStack {
-                                Label(folder.name, systemImage: "folder")
-                                    .foregroundStyle(.primary)
-                                Spacer()
-                                if let count = folder.totalElements, count > 0 {
-                                    Text("\(count)")
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
-                                }
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.bold())
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                    }
-                }
-            }
-            .navigationTitle(myLibrary ? "My Library" : "Org Library")
-            .navigationBarTitleDisplayMode(.inline)
-            .toolbar {
-                ToolbarItem(placement: .cancellationAction) {
-                    Button("Close") { dismiss() }
-                }
-                if !crumbs.isEmpty {
-                    ToolbarItem(placement: .navigation) {
-                        Button {
-                            crumbs.removeLast()
-                        } label: {
-                            Image(systemName: "chevron.backward")
-                        }
-                    }
-                }
-            }
-            .task(id: crumbs) {
-                await loadCurrentLevel()
-            }
-        }
-    }
-
-    private func loadCurrentLevel() async {
-        isLoading = true
-        loadError = nil
-        subfolders = []
-        do {
-            let folder = try await appState.client.listLibraryFolders(
-                userUUID: userUUID,
-                folderUUID: crumbs.last?.uuid,
-                myLibrary: myLibrary
-            )
-            subfolders = folder.subFolders ?? []
-        } catch {
-            loadError = error.localizedDescription
-        }
-        isLoading = false
-    }
-}
-
 struct SnippetComposerView: View {
     @EnvironmentObject private var appState: AppState
     @EnvironmentObject private var player: PlayerManager
     @Environment(\.dismiss) private var dismiss
+    @Environment(\.modelContext) private var modelContext
 
     @State var draft: SnippetDraft
     @State private var isSaving = false
@@ -2454,7 +3227,10 @@ struct SnippetComposerView: View {
     @State private var createdURL: URL?
     @State private var didCopy = false
     @State private var showFullTranscript = false
-    @State private var isPickingFolder = false
+    @Query(sort: \SnippetFolder.name) private var folders: [SnippetFolder]
+    @State private var localFolder = ""
+    @State private var isNamingFolder = false
+    @State private var newFolderName = ""
 
     var body: some View {
         NavigationStack {
@@ -2495,19 +3271,15 @@ struct SnippetComposerView: View {
             // Trimming a clip while the call keeps talking over you is disorienting.
             .onAppear {
                 if player.isPlaying { player.pause() }
-            }
-            // Folder paths differ between the personal and org libraries.
-            .onChange(of: draft.myLibrary) {
-                draft.libraryFolder = ""
-            }
-            .sheet(isPresented: $isPickingFolder) {
-                LibraryFolderPickerView(
-                    userUUID: draft.userUUID,
-                    myLibrary: draft.myLibrary
-                ) { path in
-                    draft.libraryFolder = path
+                // Attribute the snippet to me (not the call's owner) so it lands
+                // in my Attention library and shows under my user on the web.
+                if let mine = appState.myUserUUID?.nilIfBlank {
+                    draft.userUUID = mine
                 }
-                .environmentObject(appState)
+                // Web destination is automatic: my library when my email is
+                // set, the org library otherwise. Folders are local-only.
+                draft.myLibrary = appState.myUserUUID?.nilIfBlank != nil
+                draft.libraryFolder = ""
             }
         }
     }
@@ -2515,8 +3287,14 @@ struct SnippetComposerView: View {
     private var composerForm: some View {
             Form {
                 Section("Clip") {
-                    TextField("Title", text: $draft.title)
-                    TextField("Notes", text: $draft.notes, axis: .vertical)
+                    HStack {
+                        TextField("Title", text: $draft.title)
+                        ClearButton(text: $draft.title)
+                    }
+                    HStack(alignment: .top) {
+                        TextField("Notes", text: $draft.notes, axis: .vertical)
+                        ClearButton(text: $draft.notes)
+                    }
                     VStack(alignment: .leading, spacing: 10) {
                         RangeTrimSlider(
                             start: $draft.startTime,
@@ -2589,34 +3367,48 @@ struct SnippetComposerView: View {
                     Toggle("Require login", isOn: $draft.requireLogin)
                     Toggle("Notify me on views", isOn: $draft.notifyOnViews)
                     Toggle("Add to library", isOn: $draft.addToLibrary)
-                    if draft.addToLibrary {
-                        Picker("Library", selection: $draft.myLibrary) {
-                            Text("My library").tag(true)
-                            Text("Org library").tag(false)
-                        }
-                        Button {
-                            isPickingFolder = true
-                        } label: {
-                            HStack {
-                                Text("Folder")
-                                    .foregroundStyle(.primary)
-                                Spacer()
-                                Text(draft.libraryFolder.nilIfBlank ?? "Root")
-                                    .foregroundStyle(.secondary)
-                                    .lineLimit(1)
-                                    .truncationMode(.head)
-                                Image(systemName: "chevron.right")
-                                    .font(.caption.bold())
-                                    .foregroundStyle(.tertiary)
-                            }
-                        }
-                    }
                 } header: {
                     Text("Share options")
                 } footer: {
-                    Text("Require login limits viewing to people in your Attention org. Add to library also saves the snippet to your personal or org snippet library on the web, not just as a share link.")
+                    if appState.myUserUUID?.nilIfBlank != nil, appState.myEmail.contains("@") {
+                        Text("Require login limits viewing to people in your Attention org. Add to library saves the snippet to your web library as \(appState.myEmail).")
+                    } else {
+                        Text("Require login limits viewing to people in your Attention org. Add to library saves the snippet to the org's web library. Set your email in Settings to save under your account.")
+                    }
                 }
 
+                Section {
+                    Picker("Folder", selection: $localFolder) {
+                        Text("None").tag("")
+                        ForEach(folders) { folder in
+                            Text(folder.name).tag(folder.name)
+                        }
+                    }
+                    Button {
+                        newFolderName = ""
+                        isNamingFolder = true
+                    } label: {
+                        Label("New Folder…", systemImage: "folder.badge.plus")
+                    }
+                } header: {
+                    Text("On this phone")
+                } footer: {
+                    Text("Folders organize snippets in the Snippets tab. They stay on this phone.")
+                }
+
+            }
+            .alert("New Folder", isPresented: $isNamingFolder) {
+                TextField("Folder name", text: $newFolderName)
+                Button("Cancel", role: .cancel) {}
+                Button("Create") {
+                    let name = newFolderName.trimmingCharacters(in: .whitespacesAndNewlines)
+                    guard !name.isEmpty else { return }
+                    if !folders.contains(where: { $0.name == name }) {
+                        modelContext.insert(SnippetFolder(name: name))
+                        try? modelContext.save()
+                    }
+                    localFolder = name
+                }
             }
     }
 
@@ -2700,6 +3492,21 @@ struct SnippetComposerView: View {
             UIPasteboard.general.string = created.url.absoluteString
             didCopy = true
             Haptics.success()
+            // The API can't list snippets back, so remember it locally for the Snippets tab.
+            modelContext.insert(SavedSnippet(
+                snippetID: created.id,
+                title: draft.title.nilIfBlank ?? "Snippet",
+                callTitle: draft.callTitle,
+                conversationID: draft.conversationID,
+                startTime: draft.startTime,
+                endTime: draft.endTime,
+                urlString: created.url.absoluteString,
+                notes: draft.notes,
+                inLibrary: draft.addToLibrary,
+                inMyLibrary: draft.myLibrary,
+                localFolder: localFolder
+            ))
+            try? modelContext.save()
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -2959,14 +3766,455 @@ struct AskCallView: View {
     }
 }
 
+@MainActor
+enum FavoritesStore {
+    static func toggle(_ conversation: Conversation, in context: ModelContext) {
+        let id = conversation.id
+        let descriptor = FetchDescriptor<FavoriteCall>(predicate: #Predicate { $0.conversationID == id })
+        if let existing = try? context.fetch(descriptor).first {
+            context.delete(existing)
+        } else {
+            context.insert(FavoriteCall(conversationID: id, title: conversation.title))
+        }
+        try? context.save()
+    }
+}
+
+/// A device-local playlist: ordered calls, playable front to back like Spotify.
+struct PlaylistDetailView: View {
+    @EnvironmentObject private var player: PlayerManager
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    @Query private var cachedConversations: [CachedConversation]
+    @Query private var favorites: [FavoriteCall]
+    @Query private var downloadedCalls: [DownloadedCall]
+
+    let playlist: Playlist
+
+    @State private var isRenaming = false
+    @State private var renameText = ""
+    @State private var isConfirmingDelete = false
+
+    /// Playlist entries resolved to playable conversations, in playlist order.
+    private var resolvedConversations: [Conversation] {
+        let cachedByID = Dictionary(cachedConversations.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return playlist.conversationIDs.map { id in
+            cachedByID[id].map(Conversation.init(cache:))
+                ?? Conversation(
+                    id: id,
+                    title: playlist.titlesByID[id] ?? "Untitled call",
+                    createdAt: nil,
+                    duration: 0
+                )
+        }
+    }
+
+    var body: some View {
+        List {
+            if playlist.conversationIDs.isEmpty {
+                ContentUnavailableView(
+                    "Empty Playlist",
+                    systemImage: "music.note.list",
+                    description: Text("Add calls from the ⋮ menu on any call row.")
+                )
+            } else {
+                Section {
+                    Button {
+                        guard let first = resolvedConversations.first else { return }
+                        Haptics.tap()
+                        Task { await player.play(first, queue: resolvedConversations) }
+                    } label: {
+                        Label("Play All", systemImage: "play.fill")
+                            .font(.headline)
+                    }
+                }
+                Section {
+                    ForEach(resolvedConversations) { conversation in
+                        ConversationRow(
+                            conversation: conversation,
+                            downloadedCall: downloadedCalls.first { $0.conversationID == conversation.id },
+                            isFavorite: favorites.contains { $0.conversationID == conversation.id },
+                            onToggleFavorite: { FavoritesStore.toggle(conversation, in: modelContext) }
+                        ) {
+                            Task { await player.play(conversation, queue: resolvedConversations) }
+                        }
+                    }
+                    .onMove { source, destination in
+                        var ids = playlist.conversationIDs
+                        ids.move(fromOffsets: source, toOffset: destination)
+                        playlist.conversationIDs = ids
+                        try? modelContext.save()
+                    }
+                    .onDelete { offsets in
+                        var ids = playlist.conversationIDs
+                        for offset in offsets {
+                            playlist.titlesByID[ids[offset]] = nil
+                        }
+                        ids.remove(atOffsets: offsets)
+                        playlist.conversationIDs = ids
+                        try? modelContext.save()
+                    }
+                }
+            }
+        }
+        .navigationTitle(playlist.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            // EditButton inside a Menu is flaky (menu dismissal races the
+            // edit-mode toggle), so it gets its own toolbar slot.
+            if !playlist.conversationIDs.isEmpty {
+                ToolbarItem(placement: .primaryAction) {
+                    EditButton()
+                }
+            }
+            ToolbarItem(placement: .primaryAction) {
+                Menu {
+                    Button {
+                        renameText = playlist.name
+                        isRenaming = true
+                    } label: {
+                        Label("Rename", systemImage: "pencil")
+                    }
+                    Button(role: .destructive) {
+                        isConfirmingDelete = true
+                    } label: {
+                        Label("Delete Playlist", systemImage: "trash")
+                    }
+                } label: {
+                    Image(systemName: "ellipsis.circle")
+                }
+            }
+        }
+        .alert("Rename Playlist", isPresented: $isRenaming) {
+            TextField("Playlist name", text: $renameText)
+            Button("Cancel", role: .cancel) {}
+            Button("Save") {
+                let name = renameText.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { return }
+                playlist.name = name
+                try? modelContext.save()
+            }
+        }
+        .alert("Delete “\(playlist.name)”?", isPresented: $isConfirmingDelete) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                modelContext.delete(playlist)
+                try? modelContext.save()
+                dismiss()
+            }
+        } message: {
+            Text("The calls themselves are not affected.")
+        }
+    }
+}
+
+/// The "liked songs" folder: every favorited call, newest first.
+struct FavoriteCallsView: View {
+    @EnvironmentObject private var player: PlayerManager
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \FavoriteCall.createdAt, order: .reverse) private var favorites: [FavoriteCall]
+    @Query private var cachedConversations: [CachedConversation]
+    @Query private var downloadedCalls: [DownloadedCall]
+
+    private var resolvedConversations: [Conversation] {
+        let cachedByID = Dictionary(cachedConversations.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        return favorites.map { favorite in
+            cachedByID[favorite.conversationID].map(Conversation.init(cache:))
+                ?? Conversation(
+                    id: favorite.conversationID,
+                    title: favorite.title,
+                    createdAt: favorite.createdAt,
+                    duration: 0
+                )
+        }
+    }
+
+    var body: some View {
+        List {
+            if favorites.isEmpty {
+                ContentUnavailableView(
+                    "No Favorites",
+                    systemImage: "heart",
+                    description: Text("Tap the ⋮ menu on any call and choose Add to Favorites.")
+                )
+            } else {
+                Section {
+                    Button {
+                        guard let first = resolvedConversations.first else { return }
+                        Haptics.tap()
+                        Task { await player.play(first, queue: resolvedConversations) }
+                    } label: {
+                        Label("Play All", systemImage: "play.fill")
+                            .font(.headline)
+                    }
+                }
+                Section {
+                    ForEach(resolvedConversations) { conversation in
+                        ConversationRow(
+                            conversation: conversation,
+                            downloadedCall: downloadedCalls.first { $0.conversationID == conversation.id },
+                            isFavorite: true,
+                            onToggleFavorite: { FavoritesStore.toggle(conversation, in: modelContext) }
+                        ) {
+                            Task { await player.play(conversation, queue: resolvedConversations) }
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Favorites")
+        .navigationBarTitleDisplayMode(.inline)
+    }
+}
+
+/// A followed teammate's page: all calls they own, newest first — like an
+/// artist page in Spotify.
+struct ArtistDetailView: View {
+    @EnvironmentObject private var appState: AppState
+    @EnvironmentObject private var player: PlayerManager
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.dismiss) private var dismiss
+    @Query private var favorites: [FavoriteCall]
+    @Query private var downloadedCalls: [DownloadedCall]
+
+    let artist: FollowedArtist
+
+    @State private var conversations: [Conversation] = []
+    @State private var page = 1
+    @State private var pageCount = 1
+    @State private var isLoading = false
+    @State private var errorMessage: String?
+
+    var body: some View {
+        List {
+            Section {
+                VStack(spacing: 8) {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.system(size: 56))
+                        .foregroundStyle(.indigo)
+                    Text(artist.name)
+                        .font(.title3.bold())
+                    Text(artist.email)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .frame(maxWidth: .infinity)
+                .listRowBackground(Color.clear)
+            }
+
+            if let errorMessage {
+                Section {
+                    Label(errorMessage, systemImage: "exclamationmark.triangle.fill")
+                        .foregroundStyle(.orange)
+                        .font(.subheadline)
+                }
+            }
+
+            if !conversations.isEmpty {
+                Section {
+                    Button {
+                        guard let first = conversations.first else { return }
+                        Haptics.tap()
+                        Task { await player.play(first, queue: conversations) }
+                    } label: {
+                        Label("Play All", systemImage: "play.fill")
+                            .font(.headline)
+                    }
+                }
+            }
+
+            Section {
+                if conversations.isEmpty, !isLoading, errorMessage == nil {
+                    Text("No calls with \(artist.name) yet.")
+                        .foregroundStyle(.secondary)
+                }
+                ForEach(conversations) { conversation in
+                    ConversationRow(
+                        conversation: conversation,
+                        downloadedCall: downloadedCalls.first { $0.conversationID == conversation.id },
+                        isFavorite: favorites.contains { $0.conversationID == conversation.id },
+                        onToggleFavorite: { FavoritesStore.toggle(conversation, in: modelContext) }
+                    ) {
+                        Task { await player.play(conversation, queue: conversations) }
+                    }
+                    .task {
+                        if conversation.id == conversations.last?.id {
+                            await load(resetting: false)
+                        }
+                    }
+                }
+                if isLoading {
+                    HStack {
+                        Spacer()
+                        ProgressView()
+                        Spacer()
+                    }
+                }
+            }
+        }
+        .navigationTitle(artist.name)
+        .navigationBarTitleDisplayMode(.inline)
+        .toolbar {
+            ToolbarItem(placement: .primaryAction) {
+                Button("Unfollow") {
+                    modelContext.delete(artist)
+                    try? modelContext.save()
+                    dismiss()
+                }
+            }
+        }
+        .task {
+            await load(resetting: true)
+        }
+        .refreshable {
+            await load(resetting: true)
+        }
+    }
+
+    private func load(resetting: Bool) async {
+        if resetting {
+            page = 1
+            pageCount = 1
+        } else {
+            guard !isLoading, page <= pageCount else { return }
+        }
+        isLoading = true
+        defer { isLoading = false }
+        do {
+            // Participant filter, not owner: shows every call they were on
+            // (matching what search returns), not just calls they own.
+            let result = try await appState.repository.list(
+                page: page,
+                size: 25,
+                participantEmails: [artist.email]
+            )
+            if resetting {
+                conversations = result.0
+            } else {
+                conversations.append(contentsOf: result.0)
+            }
+            pageCount = max(result.1?.pageCount ?? page, 1)
+            page += 1
+            errorMessage = nil
+        } catch {
+            if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
+            errorMessage = error.localizedDescription
+        }
+    }
+}
+
+/// Directory of org teammates with follow toggles.
+struct FollowPeopleView: View {
+    @EnvironmentObject private var appState: AppState
+    @Environment(\.modelContext) private var modelContext
+    @Query(sort: \FollowedArtist.name) private var followedArtists: [FollowedArtist]
+
+    @State private var users: [AttentionUser] = []
+    @State private var isLoading = true
+    @State private var loadError: String?
+    @State private var query = ""
+
+    private var followedEmails: Set<String> {
+        Set(followedArtists.map(\.email))
+    }
+
+    private var filteredUsers: [AttentionUser] {
+        let myEmail = appState.myEmail.lowercased()
+        let usable = users.filter {
+            guard let email = $0.email?.nilIfBlank?.lowercased() else { return false }
+            return email != myEmail
+        }
+        guard let needle = query.lowercased().nilIfBlank else { return usable }
+        return usable.filter {
+            ($0.displayName ?? "").lowercased().contains(needle)
+                || ($0.email ?? "").lowercased().contains(needle)
+        }
+    }
+
+    var body: some View {
+        List {
+            if isLoading {
+                HStack(spacing: 10) {
+                    ProgressView()
+                    Text("Loading teammates…").foregroundStyle(.secondary)
+                }
+            } else if let loadError {
+                Label(loadError, systemImage: "exclamationmark.triangle.fill")
+                    .foregroundStyle(.orange)
+            }
+            ForEach(filteredUsers, id: \.email) { user in
+                let email = (user.email ?? "").lowercased()
+                let isFollowing = followedEmails.contains(email)
+                HStack(spacing: 12) {
+                    Image(systemName: "person.crop.circle.fill")
+                        .font(.title2)
+                        .foregroundStyle(isFollowing ? .indigo : .secondary)
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text(user.displayName ?? email)
+                        Text(email)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button(isFollowing ? "Following" : "Follow") {
+                        Haptics.tap()
+                        toggleFollow(email: email, name: user.displayName ?? email)
+                    }
+                    .font(.subheadline.weight(.semibold))
+                    .buttonStyle(.bordered)
+                    .tint(isFollowing ? .secondary : .indigo)
+                }
+            }
+        }
+        .navigationTitle("Follow People")
+        .navigationBarTitleDisplayMode(.inline)
+        .searchable(text: $query, placement: .navigationBarDrawer(displayMode: .always), prompt: "Search teammates")
+        .task {
+            await loadUsers()
+        }
+        .refreshable {
+            await loadUsers()
+        }
+    }
+
+    private func toggleFollow(email: String, name: String) {
+        guard !email.isEmpty else { return }
+        let descriptor = FetchDescriptor<FollowedArtist>(predicate: #Predicate { $0.email == email })
+        if let existing = try? modelContext.fetch(descriptor).first {
+            modelContext.delete(existing)
+        } else {
+            modelContext.insert(FollowedArtist(email: email, name: name))
+        }
+        try? modelContext.save()
+    }
+
+    private func loadUsers() async {
+        do {
+            users = try await appState.repository.users()
+                .sorted { ($0.displayName ?? "") < ($1.displayName ?? "") }
+            loadError = nil
+        } catch {
+            loadError = error.localizedDescription
+        }
+        isLoading = false
+    }
+}
+
 struct ConversationRow: View {
     @EnvironmentObject private var player: PlayerManager
     @EnvironmentObject private var downloads: DownloadManager
+    @Environment(\.modelContext) private var modelContext
+    @Environment(\.playlists) private var playlists
     let conversation: Conversation
     var isUnplayed: Bool = false
     var downloadedCall: DownloadedCall?
+    var isFavorite: Bool = false
+    var onToggleFavorite: (() -> Void)?
     /// Tap anywhere on the row: play immediately (Spotify behavior).
     let onPlay: () -> Void
+
+    @State private var isNamingPlaylist = false
+    @State private var newPlaylistName = ""
 
     private var isCurrent: Bool {
         player.currentConversation?.id == conversation.id
@@ -2999,6 +4247,11 @@ struct ConversationRow: View {
                             Text("·")
                             Text(createdAt.compactRelativeLabel)
                         }
+                        if isFavorite {
+                            Text("·")
+                            Image(systemName: "heart.fill")
+                                .foregroundStyle(.pink)
+                        }
                         if downloadedCall != nil {
                             Text("·")
                             Image(systemName: "arrow.down.circle.fill")
@@ -3029,6 +4282,40 @@ struct ConversationRow: View {
                 } label: {
                     Label("Add to Queue", systemImage: "text.badge.plus")
                 }
+                if let onToggleFavorite {
+                    Button {
+                        Haptics.tap()
+                        onToggleFavorite()
+                    } label: {
+                        Label(
+                            isFavorite ? "Remove from Favorites" : "Add to Favorites",
+                            systemImage: isFavorite ? "heart.slash" : "heart"
+                        )
+                    }
+                }
+                Menu {
+                    ForEach(playlists) { playlist in
+                        Button {
+                            Haptics.tap()
+                            playlist.toggle(conversation)
+                            try? modelContext.save()
+                        } label: {
+                            if playlist.contains(conversation.id) {
+                                Label(playlist.name, systemImage: "checkmark")
+                            } else {
+                                Text(playlist.name)
+                            }
+                        }
+                    }
+                    Button {
+                        newPlaylistName = ""
+                        isNamingPlaylist = true
+                    } label: {
+                        Label("New Playlist…", systemImage: "plus")
+                    }
+                } label: {
+                    Label("Add to Playlist", systemImage: "music.note.list")
+                }
                 if let webURL = conversation.webURL {
                     ShareLink(item: webURL) {
                         Label("Share Call Link", systemImage: "square.and.arrow.up")
@@ -3055,6 +4342,21 @@ struct ConversationRow: View {
                     .frame(width: 30, height: 44)
                     .contentShape(Rectangle())
             }
+        }
+        .alert("New Playlist", isPresented: $isNamingPlaylist) {
+            TextField("Playlist name", text: $newPlaylistName)
+            Button("Cancel", role: .cancel) {}
+            Button("Create") {
+                let name = newPlaylistName.trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !name.isEmpty else { return }
+                let playlist = Playlist(name: name)
+                playlist.toggle(conversation)
+                modelContext.insert(playlist)
+                try? modelContext.save()
+                Haptics.success()
+            }
+        } message: {
+            Text("“\(conversation.title)” will be added to it.")
         }
     }
 }

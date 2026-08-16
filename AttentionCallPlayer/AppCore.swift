@@ -14,7 +14,12 @@ struct AttentionCallPlayerApp: App {
             PlaybackBookmark.self,
             DownloadedCall.self,
             RecentSearch.self,
-            SuggestedEmail.self
+            SuggestedEmail.self,
+            SavedSnippet.self,
+            FavoriteCall.self,
+            Playlist.self,
+            FollowedArtist.self,
+            SnippetFolder.self
         ])
         let configuration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
         let modelContainer: ModelContainer
@@ -63,6 +68,9 @@ final class AppState: ObservableObject {
 
     @Published var apiKey: String
     @Published var myEmail: String
+    /// My Attention user UUID, resolved from myEmail via the org directory.
+    /// Used so snippets are attributed to me, not the call's owner.
+    @Published private(set) var myUserUUID: String?
     /// Bumped whenever the API key changes so Library/Search reload.
     @Published private(set) var credentialsVersion = 0
     @Published var selectedConversation: Conversation?
@@ -70,6 +78,9 @@ final class AppState: ObservableObject {
     /// Set true to present the full player sheet (e.g. Continue Listening).
     @Published var presentNowPlaying = false
     @Published var tab: AppTab = .library
+    /// Bumped when the Library tab is re-tapped while already selected;
+    /// rebuilds the Library stack so it pops back to its root.
+    @Published var libraryResetNonce = 0
 
     private let myEmailDefaultsKey = "attention.myEmail"
 
@@ -83,6 +94,19 @@ final class AppState: ObservableObject {
         self.repository = repository
         self.apiKey = keychain.readAPIKey() ?? ""
         self.myEmail = UserDefaults.standard.string(forKey: "attention.myEmail") ?? ""
+        self.myUserUUID = UserDefaults.standard.string(forKey: "attention.myUserUUID")
+    }
+
+    func resolveMyUserUUID() async {
+        guard hasAPIKey, myEmail.contains("@") else {
+            myUserUUID = nil
+            UserDefaults.standard.removeObject(forKey: "attention.myUserUUID")
+            return
+        }
+        guard let users = try? await repository.users() else { return }
+        let match = users.first { $0.email?.lowercased() == myEmail }?.uuid
+        myUserUUID = match
+        UserDefaults.standard.set(match, forKey: "attention.myUserUUID")
     }
 
     func saveAPIKey(_ value: String) {
@@ -102,6 +126,20 @@ final class AppState: ObservableObject {
         let normalized = value.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
         myEmail = normalized
         UserDefaults.standard.set(normalized, forKey: myEmailDefaultsKey)
+        Task { await resolveMyUserUUID() }
+    }
+}
+
+/// Single app-wide playlist query, injected via environment so every
+/// ConversationRow doesn't register its own SwiftData observer.
+private struct PlaylistsKey: EnvironmentKey {
+    static let defaultValue: [Playlist] = []
+}
+
+extension EnvironmentValues {
+    var playlists: [Playlist] {
+        get { self[PlaylistsKey.self] }
+        set { self[PlaylistsKey.self] = newValue }
     }
 }
 
@@ -110,6 +148,7 @@ struct RootView: View {
     @EnvironmentObject private var player: PlayerManager
     @EnvironmentObject private var downloads: DownloadManager
     @Environment(\.modelContext) private var modelContext
+    @Query(sort: \Playlist.createdAt) private var playlists: [Playlist]
     @State private var isShowingNowPlaying = false
 
     var body: some View {
@@ -121,12 +160,16 @@ struct RootView: View {
             // and scroll positions are preserved.
             ZStack {
                 LibraryView()
+                    .id(appState.libraryResetNonce)
                     .opacity(appState.tab == .library ? 1 : 0)
                     .allowsHitTesting(appState.tab == .library)
                 SearchView()
                     .opacity(appState.tab == .search ? 1 : 0)
                     .allowsHitTesting(appState.tab == .search)
-                DownloadsView()
+                SnippetsView()
+                    .opacity(appState.tab == .snippets ? 1 : 0)
+                    .allowsHitTesting(appState.tab == .snippets)
+                NavigationStack { DownloadsListView() }
                     .opacity(appState.tab == .downloads ? 1 : 0)
                     .allowsHitTesting(appState.tab == .downloads)
                 SettingsView()
@@ -144,9 +187,15 @@ struct RootView: View {
                     .transition(.move(edge: .bottom).combined(with: .opacity))
             }
 
-            BottomTabBar(selection: $appState.tab)
+            BottomTabBar(selection: $appState.tab) { tab in
+                // Re-tapping the active Library tab pops back to its root.
+                if tab == .library {
+                    appState.libraryResetNonce += 1
+                }
+            }
         }
         .animation(.easeInOut(duration: 0.2), value: player.currentConversation?.id)
+        .environment(\.playlists, playlists)
         .ignoresSafeArea(.keyboard)
         .sheet(isPresented: $isShowingNowPlaying) {
             NowPlayingView()
@@ -169,6 +218,9 @@ struct RootView: View {
             player.modelContext = modelContext
             downloads.modelContext = modelContext
         }
+        .task(id: appState.credentialsVersion) {
+            await appState.resolveMyUserUUID()
+        }
         .overlay {
             if !appState.hasAPIKey {
                 APIKeyGateView()
@@ -180,6 +232,7 @@ struct RootView: View {
 enum AppTab: Hashable, CaseIterable, Identifiable {
     case library
     case search
+    case snippets
     case downloads
     case settings
 
@@ -189,6 +242,7 @@ enum AppTab: Hashable, CaseIterable, Identifiable {
         switch self {
         case .library: return "Library"
         case .search: return "Search"
+        case .snippets: return "Snippets"
         case .downloads: return "Downloads"
         case .settings: return "Settings"
         }
@@ -198,6 +252,7 @@ enum AppTab: Hashable, CaseIterable, Identifiable {
         switch self {
         case .library: return "rectangle.stack.fill"
         case .search: return "magnifyingglass"
+        case .snippets: return "scissors"
         case .downloads: return "arrow.down.circle.fill"
         case .settings: return "gearshape.fill"
         }
@@ -206,12 +261,17 @@ enum AppTab: Hashable, CaseIterable, Identifiable {
 
 struct BottomTabBar: View {
     @Binding var selection: AppTab
+    var onReselect: (AppTab) -> Void = { _ in }
 
     var body: some View {
         HStack(spacing: 0) {
             ForEach(AppTab.allCases) { tab in
                 Button {
-                    selection = tab
+                    if selection == tab {
+                        onReselect(tab)
+                    } else {
+                        selection = tab
+                    }
                 } label: {
                     VStack(spacing: 4) {
                         Image(systemName: tab.systemImage)
