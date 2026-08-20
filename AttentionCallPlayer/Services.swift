@@ -106,6 +106,12 @@ final class AttentionAPIClient {
         self.session = session
     }
 
+    /// True when the stored key is the App Review demo key: the app then runs
+    /// against the bundled sample library instead of the Attention API.
+    var isDemoMode: Bool {
+        DemoLibrary.isDemoKey(keychain.readAPIKey())
+    }
+
     func listConversations(
         page: Int,
         size: Int = 25,
@@ -165,6 +171,9 @@ final class AttentionAPIClient {
     }
 
     func createSnippet(_ draft: SnippetDraft) async throws -> CreatedSnippetResponse {
+        if isDemoMode {
+            return DemoLibrary.createdSnippet()
+        }
         func payload(includeReference: Bool) -> CreateSnippetRequest {
             let start = max(0, draft.startTime)
             let end = max(start + 1, draft.duration > 0 ? min(draft.endTime, draft.duration) : draft.endTime)
@@ -308,6 +317,16 @@ struct ConversationRepository {
         fromDate: Date? = nil,
         toDate: Date? = nil
     ) async throws -> ([Conversation], PageMeta?) {
+        if client.isDemoMode {
+            // Page 2+ returns empty so pagination terminates cleanly.
+            guard page <= 1 else { return ([], PageMeta(pageCount: 1, totalRecords: nil, pageNumber: page, pageSize: size)) }
+            return DemoLibrary.list(
+                search: search,
+                participantEmails: participantEmails,
+                ownerEmail: ownerEmail,
+                hideInternal: hideInternal
+            )
+        }
         let response = try await client.listConversations(
             page: page,
             size: size,
@@ -322,19 +341,33 @@ struct ConversationRepository {
     }
 
     func details(id: String) async throws -> Conversation {
-        Conversation(resource: try await client.getConversation(id: id, includeTranscript: true))
+        if client.isDemoMode {
+            return try DemoLibrary.conversation(id: id)
+        }
+        return Conversation(resource: try await client.getConversation(id: id, includeTranscript: true))
     }
 
     func mediaURL(for conversationID: String) async throws -> URL {
-        try await client.generateMediaDownloadURL(conversationID: conversationID)
+        if client.isDemoMode {
+            return try DemoLibrary.mediaURL(for: conversationID)
+        }
+        return try await client.generateMediaDownloadURL(conversationID: conversationID)
     }
 
     func ask(conversationID: String, prompt: String) async throws -> [AskAttentionItem] {
-        try await client.askAttention(conversationID: conversationID, prompt: prompt)
+        if client.isDemoMode {
+            // Small delay so the loading state reads naturally.
+            try? await Task.sleep(for: .milliseconds(600))
+            return DemoLibrary.ask(conversationID: conversationID, prompt: prompt)
+        }
+        return try await client.askAttention(conversationID: conversationID, prompt: prompt)
     }
 
     func users() async throws -> [AttentionUser] {
-        try await client.listUsers()
+        if client.isDemoMode {
+            return DemoLibrary.users
+        }
+        return try await client.listUsers()
     }
 }
 
