@@ -6,6 +6,13 @@ import UIKit
 struct APIKeyGateView: View {
     @EnvironmentObject private var appState: AppState
     @State private var draftKey = ""
+    @State private var draftEmail = ""
+
+    private var canSave: Bool {
+        let key = draftKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let email = draftEmail.trimmingCharacters(in: .whitespacesAndNewlines)
+        return !key.isEmpty && (email.isEmpty || email.contains("@"))
+    }
 
     var body: some View {
         ZStack {
@@ -24,18 +31,31 @@ struct APIKeyGateView: View {
                     .font(.body)
                     .foregroundStyle(.secondary)
                     .multilineTextAlignment(.center)
-                SecureField("Bearer token", text: $draftKey)
-                    .textInputAutocapitalization(.never)
-                    .autocorrectionDisabled()
-                    .textFieldStyle(.roundedBorder)
+                VStack(alignment: .leading, spacing: 6) {
+                    SecureField("Org API key", text: $draftKey)
+                        .textInputAutocapitalization(.never)
+                        .autocorrectionDisabled()
+                        .textFieldStyle(.roundedBorder)
+                    TextField("Your work email (optional)", text: $draftEmail)
+                        .textInputAutocapitalization(.never)
+                        .keyboardType(.emailAddress)
+                        .autocorrectionDisabled()
+                        .textFieldStyle(.roundedBorder)
+                    Text("Your email powers My Calls and attributes snippets you create to you.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
                 Button {
                     appState.saveAPIKey(draftKey)
+                    if draftEmail.contains("@") {
+                        appState.saveMyEmail(draftEmail)
+                    }
                 } label: {
-                    Label("Save Key", systemImage: "key.fill")
+                    Label("Get Started", systemImage: "key.fill")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
-                .disabled(draftKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                .disabled(!canSave)
             }
             .padding(28)
         }
@@ -161,6 +181,17 @@ struct LibraryView: View {
                             .font(.caption)
                             .foregroundStyle(.secondary)
                     }
+                }
+            }
+
+            NavigationLink {
+                MyCallsView()
+            } label: {
+                Label {
+                    Text("My Calls")
+                } icon: {
+                    Image(systemName: "person.crop.circle.fill")
+                        .foregroundStyle(.indigo)
                 }
             }
 
@@ -301,6 +332,10 @@ struct NewCallsView: View {
     @Query private var downloadedCalls: [DownloadedCall]
     @Query private var favorites: [FavoriteCall]
 
+    /// When set, only calls this person was on are listed ("My Calls").
+    var participantEmail: String? = nil
+    var title: String = "New Calls"
+
     @State private var conversations: [Conversation] = []
     @State private var page = 1
     @State private var pageCount = 1
@@ -332,9 +367,13 @@ struct NewCallsView: View {
             if conversations.isEmpty, !isLoading, errorMessage == nil {
                 Section {
                     ContentUnavailableView(
-                        "No calls yet",
+                        participantEmail == nil ? "No calls yet" : "No calls with you yet",
                         systemImage: "waveform",
-                        description: Text("Pull to refresh once your calls finish processing.")
+                        description: Text(
+                            participantEmail == nil
+                                ? "Pull to refresh once your calls finish processing."
+                                : "Any call you're a participant on will show up here."
+                        )
                     )
                 }
             } else {
@@ -391,10 +430,11 @@ struct NewCallsView: View {
                 }
             }
         }
-        .navigationTitle("New Calls")
+        .navigationTitle(title)
         .navigationBarTitleDisplayMode(.inline)
         .task {
-            if conversations.isEmpty {
+            // The cache is the unfiltered feed; only seed from it for New Calls.
+            if conversations.isEmpty, participantEmail == nil {
                 conversations = cachedConversations.map(Conversation.init(cache:))
             }
             await refresh()
@@ -415,7 +455,10 @@ struct NewCallsView: View {
         isLoading = true
         defer { isLoading = false }
         do {
-            let result = try await appState.repository.list(page: page)
+            let result = try await appState.repository.list(
+                page: page,
+                participantEmails: participantEmail.map { [$0] } ?? []
+            )
             if resetting {
                 conversations = result.0
             } else {
@@ -428,6 +471,50 @@ struct NewCallsView: View {
             if error is CancellationError || (error as? URLError)?.code == .cancelled { return }
             errorMessage = error.localizedDescription
         }
+    }
+}
+
+/// Calls the user owns. Asks for their email inline if it isn't set yet.
+struct MyCallsView: View {
+    @EnvironmentObject private var appState: AppState
+    @State private var draftEmail = ""
+    @FocusState private var emailFocused: Bool
+
+    var body: some View {
+        if appState.myEmail.contains("@") {
+            NewCallsView(participantEmail: appState.myEmail, title: "My Calls")
+                .id(appState.myEmail)
+        } else {
+            Form {
+                Section {
+                    HStack {
+                        TextField("you@company.com", text: $draftEmail)
+                            .textInputAutocapitalization(.never)
+                            .keyboardType(.emailAddress)
+                            .autocorrectionDisabled()
+                            .focused($emailFocused)
+                            .submitLabel(.done)
+                            .onSubmit(save)
+                        ClearButton(text: $draftEmail)
+                    }
+                    Button("Show My Calls", action: save)
+                        .disabled(!draftEmail.contains("@"))
+                } header: {
+                    Text("Your work email")
+                } footer: {
+                    Text("Used to find calls you're on and to attribute snippets to you. You can change it anytime in Settings.")
+                }
+            }
+            .navigationTitle("My Calls")
+            .navigationBarTitleDisplayMode(.inline)
+            .onAppear { emailFocused = true }
+        }
+    }
+
+    private func save() {
+        guard draftEmail.contains("@") else { return }
+        appState.saveMyEmail(draftEmail)
+        Haptics.success()
     }
 }
 
@@ -2299,13 +2386,24 @@ struct NowPlayingView: View {
                     Button { isShowingAsk = true } label: {
                         Image(systemName: "sparkles")
                     }
-                    if let webURL = player.currentConversation?.webURL {
-                        ShareLink(item: webURL) {
-                            Image(systemName: "square.and.arrow.up")
+                    // Explicit menu instead of five loose icons: on narrower
+                    // phones the system collapsed the overflow into a "⋮"
+                    // whose icon-only entries rendered blank (looked dead).
+                    Menu {
+                        Button("Call Details", systemImage: "info.circle") {
+                            isShowingDetail = true
                         }
-                    }
-                    Button { isShowingDetail = true } label: {
-                        Image(systemName: "info.circle")
+                        if let webURL = player.currentConversation?.webURL {
+                            ShareLink(item: webURL) {
+                                Label("Share Call Link", systemImage: "square.and.arrow.up")
+                            }
+                            Button("Copy Call Link", systemImage: "link") {
+                                UIPasteboard.general.url = webURL
+                                Haptics.success()
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "ellipsis.circle")
                     }
                 }
             }
@@ -2547,8 +2645,8 @@ struct NowPlayingView: View {
     private var controls: some View {
         VStack(spacing: 12) {
             HStack(spacing: 26) {
-                transportButton(icon: "backward.end.fill", caption: "Speaker") {
-                    player.skipToPreviousSpeaker()
+                transportButton(icon: "backward.end.fill", caption: "Previous") {
+                    player.playPrevious()
                 }
                 transportButton(icon: "gobackward.\(Int(player.skipInterval))", caption: "\(Int(player.skipInterval))s") {
                     player.skip(by: -player.skipInterval)

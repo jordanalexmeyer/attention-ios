@@ -77,6 +77,9 @@ final class PlayerManager: ObservableObject {
     }
 
     func play(_ conversation: Conversation, localURL: URL? = nil, queue: [Conversation] = [], autoplay: Bool = true) async {
+        // Consume the flag up front so a failed load can't leave it armed.
+        let navigatingBack = isNavigatingBack
+        isNavigatingBack = false
         var detailed = conversation
         do {
             detailed = try await repository.details(id: conversation.id)
@@ -86,6 +89,14 @@ final class PlayerManager: ObservableObject {
                 errorMessage = error.localizedDescription
                 return
             }
+        }
+
+        // Remember where we came from so "previous" can walk back through
+        // calls (skipped when we're the ones walking back).
+        if let leaving = currentConversation, leaving.id != detailed.id, !navigatingBack {
+            history.removeAll { $0.id == leaving.id }
+            history.append(leaving)
+            if history.count > 20 { history.removeFirst() }
         }
 
         currentConversation = detailed
@@ -115,6 +126,7 @@ final class PlayerManager: ObservableObject {
     private func startItem(url: URL, resumeAt: TimeInterval, conversationID: String, allowRetry: Bool, autoplay: Bool = true) async {
         let item = AVPlayerItem(url: url)
         player.replaceCurrentItem(with: item)
+        pendingSeeks.removeAll() // seeks against the old item are moot
         if let loadedDuration = try? await item.asset.load(.duration), loadedDuration.isNumeric {
             duration = loadedDuration.seconds
         } else if let currentConversation {
@@ -142,7 +154,9 @@ final class PlayerManager: ObservableObject {
                 guard allowRetry, let self else { return }
                 do {
                     let freshURL = try await self.repository.mediaURL(for: conversationID)
-                    await self.startItem(url: freshURL, resumeAt: resumeAt, conversationID: conversationID, allowRetry: false)
+                    // Resume where the stream died, not where the call originally started.
+                    let resumePoint = self.currentTime > 1 ? self.currentTime : resumeAt
+                    await self.startItem(url: freshURL, resumeAt: resumePoint, conversationID: conversationID, allowRetry: false)
                 } catch {
                     self.errorMessage = error.localizedDescription
                     self.isPlaying = false
@@ -180,7 +194,30 @@ final class PlayerManager: ObservableObject {
         let bounded = max(0, min(seconds, duration > 0 ? duration : seconds))
         currentTime = bounded
         previewStopTime = nil
-        player.seek(to: CMTime(seconds: bounded, preferredTimescale: 600))
+        // Exact seek (default tolerance can land seconds off on streamed audio,
+        // which throws off transcript sync). While a seek is in flight the time
+        // observer is muted — otherwise a stale tick between rapid skip taps
+        // rewinds currentTime and the next tap computes from the wrong base
+        // (tap +15 three times, land at +30).
+        if player.currentItem != nil {
+            seekGeneration += 1
+            let generation = seekGeneration
+            pendingSeeks.insert(generation)
+            player.seek(
+                to: CMTime(seconds: bounded, preferredTimescale: 600),
+                toleranceBefore: .zero,
+                toleranceAfter: .zero
+            ) { [weak self] _ in
+                Task { @MainActor in
+                    self?.pendingSeeks.remove(generation)
+                }
+            }
+            // Safety net: never leave the observer muted if a completion is lost.
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(for: .seconds(2))
+                self?.pendingSeeks.remove(generation)
+            }
+        }
         saveBookmark()
         updateNowPlaying()
     }
@@ -208,6 +245,26 @@ final class PlayerManager: ObservableObject {
     func skipToPreviousSpeaker() {
         let earlier = currentTranscript.last(where: { $0.startTime < currentTime - 1.0 })
         seek(to: earlier?.startTime ?? 0)
+    }
+
+    /// Standard previous-track semantics: restart the call if we're past the
+    /// first few seconds, otherwise go back to the call played before this one
+    /// (re-queuing the current call so "next" returns to it).
+    func playPrevious() {
+        if currentTime > 3 || history.isEmpty {
+            seek(to: 0)
+            return
+        }
+        let previous = history.removeLast()
+        var nextQueue = queue
+        if let current = currentConversation {
+            nextQueue.insert(current, at: 0)
+            manuallyQueuedIDs.insert(current.id)
+        }
+        isNavigatingBack = true
+        Task {
+            await play(previous, queue: nextQueue)
+        }
     }
 
     func playNext() {
@@ -345,6 +402,12 @@ final class PlayerManager: ObservableObject {
     /// Calls the user deliberately added via "Add to Queue" — these always play
     /// on auto-advance, unlike calls auto-queued from a list context.
     private var manuallyQueuedIDs: Set<String> = []
+    /// Calls played before the current one, oldest first (for "previous").
+    private var history: [Conversation] = []
+    private var isNavigatingBack = false
+    /// Seeks awaiting completion; time-observer ticks are ignored while non-empty.
+    private var pendingSeeks: Set<Int> = []
+    private var seekGeneration = 0
     /// Calls skipped via "next" this session. Excluded from the auto-advance
     /// fallback, otherwise skipping an in-progress call just offers it right
     /// back (its bookmark is always the most recently updated) — infinite loop.
@@ -498,10 +561,10 @@ final class PlayerManager: ObservableObject {
             }
             return .success
         }
-        // Triple-squeeze: restart the current call (standard previous-track semantics).
+        // Triple-squeeze: restart, or previous call if we just started this one.
         center.previousTrackCommand.addTarget { [weak self] _ in
             Task { @MainActor in
-                self?.seek(to: 0)
+                self?.playPrevious()
             }
             return .success
         }
@@ -515,7 +578,7 @@ final class PlayerManager: ObservableObject {
             queue: .main
         ) { [weak self] time in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.pendingSeeks.isEmpty else { return }
                 self.currentTime = time.seconds
                 if let stopAt = self.previewStopTime, time.seconds >= stopAt {
                     self.pause()
@@ -570,8 +633,10 @@ final class PlayerManager: ObservableObject {
             ))
         }
         try? modelContext.save()
-        // Zero the clock so the pause() below can't re-save the end position.
+        // Zero the clock so the pause() below can't re-save the end position,
+        // and hold off the throttled save so a trailing tick can't un-finish it.
         currentTime = 0
+        lastBookmarkSave = Date()
     }
 
     private func bookmarkPosition(for conversationID: String) -> TimeInterval {
@@ -588,7 +653,7 @@ final class PlayerManager: ObservableObject {
     }
 
     private func saveBookmark() {
-        guard let currentConversation, currentTime.isFinite, currentTime > 2, let modelContext else {
+        guard let currentConversation, currentTime.isFinite, let modelContext else {
             return
         }
         lastBookmarkSave = Date()
@@ -598,10 +663,20 @@ final class PlayerManager: ObservableObject {
             predicate: #Predicate { $0.conversationID == conversationID }
         )
         if let bookmark = try? modelContext.fetch(descriptor).first {
+            // Existing bookmark: always track position, including an explicit
+            // restart to 0 (previously dropped, so "restart" didn't stick).
             bookmark.position = currentTime
             bookmark.duration = duration
             bookmark.updatedAt = Date()
+            // Re-listening to a finished call mid-way makes it in progress
+            // again; without this the completed flag stuck forever, so the call
+            // always restarted from 0 and auto-advance skipped it for good.
+            if bookmark.completed, currentTime > 2, duration <= 0 || currentTime < duration - 10 {
+                bookmark.completed = false
+            }
         } else {
+            // Don't create a bookmark (i.e. mark as "played") for a call that barely started.
+            guard currentTime > 2 else { return }
             modelContext.insert(PlaybackBookmark(
                 conversationID: conversationID,
                 title: title,
