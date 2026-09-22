@@ -2252,10 +2252,17 @@ struct MiniPlayerView: View {
                     Haptics.tap()
                     player.playPause()
                 } label: {
-                    Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
-                        .font(.title3)
-                        .foregroundStyle(.primary)
-                        .frame(width: 36, height: 36)
+                    Group {
+                        if player.isLoadingTrack {
+                            ProgressView()
+                                .controlSize(.small)
+                        } else {
+                            Image(systemName: player.isPlaying ? "pause.fill" : "play.fill")
+                                .font(.title3)
+                                .foregroundStyle(.primary)
+                        }
+                    }
+                    .frame(width: 36, height: 36)
                 }
                 .buttonStyle(.plain)
                 }
@@ -2658,8 +2665,17 @@ struct NowPlayingView: View {
                     // Invisible caption mirrors the transport buttons' layout so
                     // all icons share the same vertical center.
                     VStack(spacing: 3) {
-                        Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
-                            .font(.system(size: 58))
+                        ZStack {
+                            // Keep the circle so the layout doesn't jump; spin over it while loading.
+                            Image(systemName: player.isPlaying ? "pause.circle.fill" : "play.circle.fill")
+                                .font(.system(size: 58))
+                                .opacity(player.isLoadingTrack ? 0.25 : 1)
+                            if player.isLoadingTrack {
+                                ProgressView()
+                                    .controlSize(.large)
+                                    .tint(.white)
+                            }
+                        }
                         Text(" ")
                             .font(.system(size: 9, weight: .medium))
                             .hidden()

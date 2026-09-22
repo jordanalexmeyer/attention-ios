@@ -17,6 +17,8 @@ final class PlayerManager: ObservableObject {
     @Published private(set) var currentTime: TimeInterval = 0
     @Published private(set) var duration: TimeInterval = 0
     @Published private(set) var isPlaying = false
+    /// True from the moment a call is chosen until its audio is ready to play.
+    @Published private(set) var isLoadingTrack = false
     @Published private(set) var queue: [Conversation] = []
     @Published var playbackRate: Float = UserDefaults.standard.object(forKey: "attention.playbackRate") as? Float ?? 1.0 {
         didSet {
@@ -80,92 +82,145 @@ final class PlayerManager: ObservableObject {
         // Consume the flag up front so a failed load can't leave it armed.
         let navigatingBack = isNavigatingBack
         isNavigatingBack = false
-        var detailed = conversation
-        do {
-            detailed = try await repository.details(id: conversation.id)
-        } catch {
+
+        // Every play() supersedes the one before it. Rapid "next" taps used to
+        // spawn concurrent loads that all raced to replace the item and queue;
+        // now only the newest one is allowed to land.
+        loadGeneration += 1
+        let generation = loadGeneration
+
+        // Switch the UI to the new call *immediately* — before any network —
+        // and stop the old audio so it doesn't keep talking while we load.
+        if let leaving = currentConversation, leaving.id != conversation.id {
+            saveBookmark() // don't lose up to 5s of progress on the call we're leaving
+            if !navigatingBack {
+                history.removeAll { $0.id == leaving.id }
+                history.append(leaving)
+                if history.count > 20 { history.removeFirst() }
+                persistHistory()
+            }
+        }
+        player.pause()
+        player.replaceCurrentItem(with: nil)
+        removeItemObservers()
+        pendingSeeks.removeAll()
+        smartSpeedTask?.cancel()
+        isPlaying = false
+        isLoadingTrack = true
+        previewStopTime = nil
+        errorMessage = nil
+        trackStartedAt = Date()
+
+        currentConversation = conversation
+        currentTranscript = conversation.transcript
+        flatWords = conversation.transcript.flatMap(\.words)
+        duration = conversation.duration
+        let resumeAt = bookmarkPosition(for: conversation.id)
+        currentTime = resumeAt
+        trackResumePosition = resumeAt
+        // Deliberately playing a call forgives an earlier "next" skip.
+        sessionSkippedIDs.remove(conversation.id)
+        self.queue = queue.filter { $0.id != conversation.id }
+        manuallyQueuedIDs.formIntersection(self.queue.map(\.id))
+        persistQueue()
+        updateNowPlaying()
+
+        // Transcript and media URL are independent requests — fetch them together.
+        let repository = self.repository
+        let conversationID = conversation.id
+        async let detailsResult = Self.attempt { try await repository.details(id: conversationID) }
+        async let urlResult = Self.attempt {
+            if let localURL { return localURL }
+            return try await repository.mediaURL(for: conversationID)
+        }
+        let (details, url) = await (detailsResult, urlResult)
+        guard generation == loadGeneration else { return } // superseded by a newer play()
+
+        switch details {
+        case .success(let detailed):
+            currentConversation = detailed
+            currentTranscript = detailed.transcript
+            flatWords = detailed.transcript.flatMap(\.words)
+            if detailed.duration > 0 { duration = detailed.duration }
+        case .failure(let error):
             // Offline (or API failure): a downloaded file can still play, just without a transcript.
             guard localURL != nil else {
                 errorMessage = error.localizedDescription
+                isLoadingTrack = false
                 return
             }
         }
 
-        // Remember where we came from so "previous" can walk back through
-        // calls (skipped when we're the ones walking back).
-        if let leaving = currentConversation, leaving.id != detailed.id, !navigatingBack {
-            history.removeAll { $0.id == leaving.id }
-            history.append(leaving)
-            if history.count > 20 { history.removeFirst() }
-        }
-
-        currentConversation = detailed
-        currentTranscript = detailed.transcript
-        flatWords = detailed.transcript.flatMap(\.words)
-        // Deliberately playing a call forgives an earlier "next" skip.
-        sessionSkippedIDs.remove(detailed.id)
-        self.queue = queue.filter { $0.id != conversation.id }
-        manuallyQueuedIDs.formIntersection(self.queue.map(\.id))
-        persistQueue()
-        let resumeAt = bookmarkPosition(for: detailed.id)
-
-        if let localURL {
-            await startItem(url: localURL, resumeAt: resumeAt, conversationID: detailed.id, allowRetry: false, autoplay: autoplay)
-            return
-        }
-
-        do {
-            let url = try await playbackURL(for: detailed, localURL: nil)
-            await startItem(url: url, resumeAt: resumeAt, conversationID: detailed.id, allowRetry: true, autoplay: autoplay)
-        } catch {
+        switch url {
+        case .success(let mediaURL):
+            startItem(url: mediaURL, resumeAt: resumeAt, conversationID: conversation.id, allowRetry: localURL == nil, autoplay: autoplay)
+        case .failure(let error):
             errorMessage = error.localizedDescription
-            isPlaying = false
+            isLoadingTrack = false
         }
     }
 
-    private func startItem(url: URL, resumeAt: TimeInterval, conversationID: String, allowRetry: Bool, autoplay: Bool = true) async {
+    private func startItem(url: URL, resumeAt: TimeInterval, conversationID: String, allowRetry: Bool, autoplay: Bool = true) {
         let item = AVPlayerItem(url: url)
+        removeItemObservers()
         player.replaceCurrentItem(with: item)
         pendingSeeks.removeAll() // seeks against the old item are moot
-        if let loadedDuration = try? await item.asset.load(.duration), loadedDuration.isNumeric {
-            duration = loadedDuration.seconds
-        } else if let currentConversation {
-            duration = currentConversation.duration
-        }
         seek(to: resumeAt)
         if autoplay {
             activateAudioSession()
             player.playImmediately(atRate: playbackRate)
         }
         isPlaying = autoplay
+        isLoadingTrack = false
         observeItemEnd(item)
         observeItemFailure(item, conversationID: conversationID, resumeAt: resumeAt, allowRetry: allowRetry)
         updateNowPlaying()
         startSmartSpeedLoopIfNeeded()
+
+        // The real duration needs a round-trip to the file header; don't hold
+        // up playback for it — refine once it arrives.
+        Task { [weak self] in
+            guard let loaded = try? await item.asset.load(.duration), loaded.isNumeric else { return }
+            await MainActor.run {
+                guard let self, self.player.currentItem === item else { return }
+                self.duration = loaded.seconds
+                self.updateNowPlaying()
+            }
+        }
     }
 
     private func observeItemFailure(_ item: AVPlayerItem, conversationID: String, resumeAt: TimeInterval, allowRetry: Bool) {
-        NotificationCenter.default.addObserver(
+        let token = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemFailedToPlayToEndTime,
             object: item,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                guard allowRetry, let self else { return }
+                guard allowRetry, let self, self.currentConversation?.id == conversationID else { return }
                 do {
                     let freshURL = try await self.repository.mediaURL(for: conversationID)
+                    guard self.currentConversation?.id == conversationID else { return }
                     // Resume where the stream died, not where the call originally started.
                     let resumePoint = self.currentTime > 1 ? self.currentTime : resumeAt
-                    await self.startItem(url: freshURL, resumeAt: resumePoint, conversationID: conversationID, allowRetry: false)
+                    self.startItem(url: freshURL, resumeAt: resumePoint, conversationID: conversationID, allowRetry: false)
                 } catch {
                     self.errorMessage = error.localizedDescription
                     self.isPlaying = false
                 }
             }
         }
+        itemObservers.append(token)
+    }
+
+    private func removeItemObservers() {
+        for token in itemObservers {
+            NotificationCenter.default.removeObserver(token)
+        }
+        itemObservers.removeAll()
     }
 
     func playPause() {
+        guard !isLoadingTrack else { return }
         if isPlaying {
             pause()
         } else {
@@ -251,11 +306,27 @@ final class PlayerManager: ObservableObject {
     /// first few seconds, otherwise go back to the call played before this one
     /// (re-queuing the current call so "next" returns to it).
     func playPrevious() {
-        if currentTime > 3 || history.isEmpty {
+        // Ignore taps while a track is still loading — the previous tap already
+        // acted, and acting again would walk back two calls.
+        guard !isLoadingTrack else { return }
+        let now = Date()
+        // "Just started" is measured from where this call *resumed*, not from
+        // 0:00 — calls usually pick up mid-way from a bookmark, so an absolute
+        // `currentTime > 3` check meant previous could only ever restart.
+        let playedThisSession = max(0, currentTime - trackResumePosition)
+        let justStarted = playedThisSession < 3 || now.timeIntervalSince(trackStartedAt) < 3
+        // A second tap shortly after a restart also goes back (double-tap).
+        let doubleTap = lastRestartTap.map { now.timeIntervalSince($0) < 4 } ?? false
+
+        guard !history.isEmpty, justStarted || doubleTap else {
             seek(to: 0)
+            trackResumePosition = 0
+            lastRestartTap = now
             return
         }
+        lastRestartTap = nil
         let previous = history.removeLast()
+        persistHistory()
         var nextQueue = queue
         if let current = currentConversation {
             nextQueue.insert(current, at: 0)
@@ -268,6 +339,9 @@ final class PlayerManager: ObservableObject {
     }
 
     func playNext() {
+        // The previous tap is still loading its call; a second one would skip
+        // straight past it.
+        guard !isLoadingTrack else { return }
         // Leaving a call unfinished via "next" means "not this one right now" —
         // don't offer it again this session. (A call that just played to the
         // end is already marked finished, so it won't be added here.)
@@ -405,6 +479,23 @@ final class PlayerManager: ObservableObject {
     /// Calls played before the current one, oldest first (for "previous").
     private var history: [Conversation] = []
     private var isNavigatingBack = false
+    /// Where the current call picked up from and when — "previous" treats the
+    /// first few seconds after that as "just started".
+    private var trackResumePosition: TimeInterval = 0
+    private var trackStartedAt = Date.distantPast
+    private var lastRestartTap: Date?
+    /// Monotonic token so a superseded play() can't apply its results.
+    private var loadGeneration = 0
+    /// Notification observers for the current AVPlayerItem (removed on swap).
+    private var itemObservers: [NSObjectProtocol] = []
+
+    private static func attempt<T>(_ body: () async throws -> T) async -> Result<T, Error> {
+        do {
+            return .success(try await body())
+        } catch {
+            return .failure(error)
+        }
+    }
     /// Seeks awaiting completion; time-observer ticks are ignored while non-empty.
     private var pendingSeeks: Set<Int> = []
     private var seekGeneration = 0
@@ -446,22 +537,31 @@ final class PlayerManager: ObservableObject {
 
     private let queueDefaultsKey = "attention.queueIDs"
     private let manualQueueDefaultsKey = "attention.manualQueueIDs"
+    private let historyDefaultsKey = "attention.historyIDs"
 
     private func persistQueue() {
         UserDefaults.standard.set(queue.map(\.id), forKey: queueDefaultsKey)
         UserDefaults.standard.set(Array(manuallyQueuedIDs), forKey: manualQueueDefaultsKey)
     }
 
-    /// Rebuild the queue from cached conversations after a relaunch.
+    private func persistHistory() {
+        UserDefaults.standard.set(history.map(\.id), forKey: historyDefaultsKey)
+    }
+
+    /// Rebuild the queue and "previous" history from cached conversations after a relaunch.
     private func restoreQueueIfNeeded() {
         guard queue.isEmpty, let modelContext else { return }
-        let ids = UserDefaults.standard.stringArray(forKey: queueDefaultsKey) ?? []
-        guard !ids.isEmpty else { return }
+        let queueIDs = UserDefaults.standard.stringArray(forKey: queueDefaultsKey) ?? []
+        let historyIDs = UserDefaults.standard.stringArray(forKey: historyDefaultsKey) ?? []
+        guard !queueIDs.isEmpty || !historyIDs.isEmpty else { return }
         let cached = (try? modelContext.fetch(FetchDescriptor<CachedConversation>())) ?? []
         let byID = Dictionary(cached.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
-        queue = ids.compactMap { byID[$0].map(Conversation.init(cache:)) }
+        queue = queueIDs.compactMap { byID[$0].map(Conversation.init(cache:)) }
         let manual = UserDefaults.standard.stringArray(forKey: manualQueueDefaultsKey) ?? []
         manuallyQueuedIDs = Set(manual).intersection(queue.map(\.id))
+        if history.isEmpty {
+            history = historyIDs.compactMap { byID[$0].map(Conversation.init(cache:)) }
+        }
     }
 
     func currentWord(at time: TimeInterval? = nil) -> TranscriptWord? {
@@ -594,13 +694,13 @@ final class PlayerManager: ObservableObject {
     }
 
     private func observeItemEnd(_ item: AVPlayerItem) {
-        NotificationCenter.default.addObserver(
+        let token = NotificationCenter.default.addObserver(
             forName: .AVPlayerItemDidPlayToEndTime,
             object: item,
             queue: .main
         ) { [weak self] _ in
             Task { @MainActor in
-                guard let self else { return }
+                guard let self, self.player.currentItem === item else { return }
                 self.markCurrentCallFinished()
                 if self.autoplayQueueEnabled {
                     self.playNext()
@@ -609,6 +709,7 @@ final class PlayerManager: ObservableObject {
                 }
             }
         }
+        itemObservers.append(token)
     }
 
     /// A call that played to the end keeps its bookmark (so it still counts as
